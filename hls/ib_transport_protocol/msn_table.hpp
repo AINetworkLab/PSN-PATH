@@ -29,7 +29,7 @@ EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
 #include "../axi_utils.hpp"
-#include <rocev2_config.hpp> //defines MAX_QPS
+#include "rocev2_config.hpp" //defines MAX_QPS
 
 struct ifMsnReq
 {
@@ -134,7 +134,9 @@ void msn_table(hls::stream<rxMsnReq>&		rxExh2msnTable_upd_req,
 	else if (!if2msnTable_init.empty()) //move up??
 	{
 		if2msnTable_init.read(ifRequest);
+		#ifdef DEBUG
 		std::cout << std::hex << "[MSN TABLE " << INSTID << "]: MSN init for qpn " << ifRequest.qpn << std::endl;
+		#endif
 		msn_table[ifRequest.qpn].msn = 0;
 		msn_table[ifRequest.qpn].vaddr = 0; //TODO requried?
 		msn_table[ifRequest.qpn].dma_length = 0;  //TODO requried?

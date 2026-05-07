@@ -37,11 +37,14 @@ EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 using namespace hls;
 
-#define DBG_IBV
+// #define DBG_IBV
+#define DEBUG
+
 
 const uint32_t BTH_SIZE = 96;
 const uint32_t RETH_SIZE = 128;
 const uint32_t AETH_SIZE = 32;
+const uint32_t SAETH_SIZE = 160;
 const uint32_t IMMDT_SIZE = 32;
 
 const uint32_t RETRANS_RETRY_CNT = 12;
@@ -103,12 +106,14 @@ typedef enum {
 	RC_RDMA_READ_RESP_LAST = 0x0F,
 	RC_RDMA_READ_RESP_ONLY = 0x10,
 	RC_ACK = 0x11,
+	RC_SACK = 0x12
 } ibOpCode;
 
 bool checkIfResponse(ibOpCode code);
 bool checkIfWrite(ibOpCode code);
 bool checkIfAethHeader(ibOpCode code);
 bool checkIfRethHeader(ibOpCode code);
+bool checkIfSAckHeader(ibOpCode code);
 
 /* QP context */
 struct qpContext
@@ -266,6 +271,39 @@ struct ackEvent
 			:qpn(qp), psn(psn), validPsn(true), isNak(nak) {}
 };
 
+// struct sAckEvent
+// {
+// 	ap_uint<24> qpn;
+// 	ap_uint<24> psn;
+// 	ap_uint<24> e_psn;
+// 	sAckEvent(){}
+// 	sAckEvent(ap_uint<24> qpn,ap_uint<24> psn,ap_uint<24> e_psn)
+// 		:qpn(qpn),psn(psn),e_psn(e_psn){}
+// };
+
+struct retrans
+{
+    ap_uint<16> qpn;
+    ap_uint<128> bitState;
+    ap_uint<24> epsn;
+    ap_uint<24> psn;
+	bool overBit;
+    retrans(){}
+    retrans(ap_uint<16> qpn,ap_uint<24> psn): qpn(qpn),bitState(0),psn(psn),overBit(true) {}
+    retrans(ap_uint<16> qpn,ap_uint<24> epsn,ap_uint<24> psn):qpn(qpn),epsn(epsn),psn(psn),overBit(true){}
+    retrans(ap_uint<16> qpn,ap_uint<128> bitState,ap_uint<24> epsn,ap_uint<24> psn):qpn(qpn),bitState(bitState),epsn(epsn),psn(psn),overBit(false){}
+};
+
+struct TxSack
+{
+	ap_uint<10> repNum;
+	ap_uint<128> bitState;
+	ap_uint<24> psn;
+	bool overBit;
+	TxSack(){}
+	TxSack(ap_uint<24> psn):psn(psn),overBit(true){}
+	TxSack(ap_uint<7> repNum,ap_uint<128> bitState,ap_uint<24> psn):repNum(repNum),bitState(bitState),psn(psn),overBit(false){}
+};
 //TODO create readEvent
 //TODO event for writes addr + len, no psn
 struct event
@@ -275,6 +313,9 @@ struct event
 	ap_uint<64> addr;
 	ap_uint<32> length;
 	ap_uint<24>	psn;
+	ap_uint<24> e_psn;
+	ap_uint<128> bitState;
+	bool 		overBit;
 	bool		validPsn;
 	bool		isNak;
 	event()
@@ -293,6 +334,7 @@ struct event
 		:op_code(op), qpn(qp), addr(0), length(len), psn(psn), validPsn(true), isNak(false) {}
 	event(ibOpCode op, ap_uint<24> qp, ap_uint<64> addr, ap_uint<32> len, ap_uint<24> psn)
 		:op_code(op), qpn(qp), addr(addr), length(len), psn(psn), validPsn(true), isNak(false) {}
+	event(retrans& retr):op_code(RC_SACK),qpn(retr.qpn),psn(retr.psn),e_psn(retr.epsn),bitState(retr.bitState),overBit(retr.overBit){}
 };
 
 /* Pakage info */
@@ -518,6 +560,69 @@ public:
 };
 
 template <int W>
+class SAckExHeader : public packetHeader<W, SAETH_SIZE> //AETH
+{
+	using packetHeader<W, SAETH_SIZE>::header;
+
+public:
+	SAckExHeader() {}
+
+	void setRetranNum(ap_uint<7> pkgNum){
+		header(6,0) = pkgNum;
+	}
+	ap_uint<7> getRetransNum(){
+		return ((ap_uint<7>)header(6,0));
+	}
+	void setIsOver(ap_uint<1> over){
+		header[7] = over;
+	}
+	ap_uint<1> getIsOver(){
+		return header[7];
+	}
+	void setPsn(ap_uint<24> psn){  
+		header(31,8) = reverse(psn);
+	}
+	ap_uint<24> getPsn(){
+		return reverse((ap_uint<24>)header(31,8));
+	}
+	void setBitState(ap_uint<128> bitState){
+		header(159,32)  = reverse(bitState);
+	}
+	ap_uint<128> getBitState(){
+		return reverse((ap_uint<128>)header(159,32));
+	}
+};
+// 分组选择重传
+template <int W>
+class SGAckExHeader : public packetHeader<W, AETH_SIZE> //AETH
+{
+	using packetHeader<W, AETH_SIZE>::header;
+
+public:
+	SGAckExHeader() {}
+
+	void setSyndrome(ap_uint<8> syn)
+	{
+		header(7, 0) = syn;
+	}
+	ap_uint<8> getSyndrome()
+	{
+		return ((ap_uint<8>) header(7, 0));
+	}
+	void setMsn(ap_uint<24> msn)
+	{
+		header(31, 8) = reverse(msn);
+	}
+	ap_uint<24> getMsn()
+	{
+		return reverse((ap_uint<24>) header(31, 8));
+	}
+	bool isNAK()
+	{
+		return (header(6,5) == 0x3);
+	}
+};
+template <int W>
 class ExHeader: public packetHeader<W, RETH_SIZE>
 {
 	using packetHeader<W, RETH_SIZE>::header;
@@ -578,7 +683,14 @@ struct rtrPkg
 	rtrPkg(ap_uint<24> r1, ap_uint<24> r2, ap_uint<4> ctl) 
 		: r1(r1), r2(r2), ctl(ctl) {}
 };
-
+struct testForSwitch
+{
+	ap_uint<24> psn;
+	ap_uint<24> op;
+	ap_uint<1> retr;
+	testForSwitch(){}
+	testForSwitch(ap_uint<24> psn,ap_uint<24> op, ap_uint<1> retr):psn(psn),op(op),retr(retr){}
+};
 template <int WIDTH, int INSTID>
 void ib_transport_protocol(	
 	// RX - net module
@@ -614,5 +726,9 @@ void ib_transport_protocol(
 	ap_uint<32>& regInvalidPsnDropCount,
     ap_uint<32>& regRetransCount,
 	ap_uint<32>& regIbvCountRx,
-    ap_uint<32>& regIbvCountTx
+    ap_uint<32>& regIbvCountTx,
+	stream<testForSwitch>& ibOpCodeFifo,
+	int& sendPkgNum,
+	bool& isrecv,
+	int& disOrderCount
 );

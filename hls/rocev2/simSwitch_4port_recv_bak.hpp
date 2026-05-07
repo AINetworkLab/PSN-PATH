@@ -29,24 +29,21 @@
 #include <random>
 using namespace hls;
 
-// #define N_NODE_4
+#define RECV_N_NODE_4 4
 #define PORT_LOC 5000
 #define PORT_RMT 5001
 #define PKT_LEN  64
 #define PKT_LEN2 64
 #define CLK_SIM 5000
-#define ALLPKGNUM 1000
 
-#ifdef N_NODE_4
-#define FWDMETA(srcNode)                                                        \
+#ifdef RECV_N_NODE_4
+#define RECVFWMETA(srcNode)                                                        \
     if (!s_axis_tx_meta_n##srcNode.empty() && !udpMetaVldN##srcNode){           \
         s_axis_tx_meta_n##srcNode.read(udpMetaN##srcNode);                      \
         udpMetaVldN##srcNode = true;                                            \
         cntPacketN##srcNode++;                                                  \
-        if(dropEveryNPacket)                                                    \
-            dropPacketN##srcNode = (cntPacketN##srcNode % dropEveryNPacket)==0; \
-        if(dropPacketN##srcNode);                                               \
-        else if(udpMetaN##srcNode.their_address==ip_address_n0)                 \
+        std::cout<<"recv switch:来自 "<<srcNode<<std::endl;\
+        if(udpMetaN##srcNode.their_address==ip_address_n0)                 \
             m_axis_rx_meta_n0.write(udpMetaN##srcNode);                         \
         else if(udpMetaN##srcNode.their_address==ip_address_n1)                 \
             m_axis_rx_meta_n1.write(udpMetaN##srcNode);                         \
@@ -54,9 +51,19 @@ using namespace hls;
             m_axis_rx_meta_n2.write(udpMetaN##srcNode);                         \
         else                                                                    \
             m_axis_rx_meta_n3.write(udpMetaN##srcNode);                         \
-    }
+        if(srcNode !=1){                 \
+            onSend = true;              \
+        }                               \
+        else{                               \
+            if(!recvIbOpcodeFifo_n1.empty()){   \
+                testForSwitch ib_op;            \
+                recvIbOpcodeFifo_n1.read(ib_op);\
+                txIbOpcodeFifo_n0.write(ib_op); \
+            }                                       \
+        }                                               \
+        }
 #else
-#define FWDMETA(srcNode)                                                        \
+#define RECVFWMETA(srcNode)                                                        \
     if (!s_axis_tx_meta_n##srcNode.empty() && !udpMetaVldN##srcNode && !recvIbOpcodeFifo_n##srcNode.empty()){           \
         s_axis_tx_meta_n##srcNode.read(udpMetaN##srcNode);                      \
         recvIbOpcodeFifo_n##srcNode.read(ib_opN##srcNode);                      \
@@ -64,10 +71,7 @@ using namespace hls;
         cntPacketN##srcNode++;                                                  \
         double loss_r=dis(gen);                                                 \
         /*std::cout<<"loss_r:\t"<<loss_r<<std::endl;*/                              \
-        if(ib_opN##srcNode.op == 0x06){\
-            firstPsn = ib_opN##srcNode.psn;\
-        }\
-        if(loss_r<dropEveryNPacket && ib_opN##srcNode.op == 0x07 && ib_opN##srcNode.retr==0 && ib_opN##srcNode.psn - firstPsn + 1 < ALLPKGNUM - 4){              \
+        if(loss_r<dropEveryNPacket && ib_opN##srcNode.op == 0x07 && ib_opN##srcNode.retr==0){              \
             std::cout<<"发生丢失:\t"<<ib_opN##srcNode.psn<<std::endl;            \
             dropPacketN##srcNode = true;                                        \
         }else{                                                                  \
@@ -84,8 +88,8 @@ using namespace hls;
     }                                                                   
 #endif
 
-#ifdef N_NODE_4
-#define FWDDATA(srcNode)                                                \
+#ifdef RECV_N_NODE_4
+#define RECVFWDATA(srcNode)                                                \
     if (!s_axis_tx_data_n##srcNode.empty() && udpMetaVldN##srcNode){    \
         s_axis_tx_data_n##srcNode.read(currWordN##srcNode);             \
         if(dropPacketN##srcNode);                                        \
@@ -100,10 +104,13 @@ using namespace hls;
         if(currWordN##srcNode.last){                                    \
             udpMetaVldN##srcNode = false;                               \
             dropPacketN##srcNode = false;                               \
+            if(srcNode!=1){\
+                onSend = false;\
+            }\
         }                                                               \
     }
 #else
-#define FWDDATA(srcNode)                                                \
+#define RECVFWDATA(srcNode)                                                \
     if (!s_axis_tx_data_n##srcNode.empty() && udpMetaVldN##srcNode){    \
         s_axis_tx_data_n##srcNode.read(currWordN##srcNode);             \
         if(dropPacketN##srcNode);                                       \
@@ -165,22 +172,22 @@ using namespace hls;
 // simulate switch behavior with udp packets
 // ------------------------------------------------------------------------------------------------
 template <int WIDTH>
-void simSwitch( 
+void simSwitchRecv( 
     // RX - net module
     stream<ipUdpMeta>& m_axis_rx_meta_n0,
     stream<net_axis<WIDTH> >& m_axis_rx_data_n0,
     // TX - net module
     stream<ipUdpMeta>& s_axis_tx_meta_n0,
     stream<net_axis<WIDTH> >& s_axis_tx_data_n0,
-    stream<testForSwitch>&   recvIbOpcodeFifo_n0,
+    stream<testForSwitch>&   recvIbOpcodeFifo_n1,
+    stream<testForSwitch>&   txIbOpcodeFifo_n0,
 
     stream<ipUdpMeta>& m_axis_rx_meta_n1,
     stream<net_axis<WIDTH> >& m_axis_rx_data_n1,
     stream<ipUdpMeta>& s_axis_tx_meta_n1,
     stream<net_axis<WIDTH> >& s_axis_tx_data_n1,
-    stream<testForSwitch>&   recvIbOpcodeFifo_n1,
 
-#ifdef N_NODE_4
+#ifdef RECV_N_NODE_4
     stream<ipUdpMeta>& m_axis_rx_meta_n2,
     stream<net_axis<WIDTH> >& m_axis_rx_data_n2,
     stream<ipUdpMeta>& s_axis_tx_meta_n2,
@@ -190,13 +197,19 @@ void simSwitch(
     stream<net_axis<WIDTH> >& m_axis_rx_data_n3,
     stream<ipUdpMeta>& s_axis_tx_meta_n3,
     stream<net_axis<WIDTH> >& s_axis_tx_data_n3,
+
+    stream<ipUdpMeta>& m_axis_rx_meta_n4,
+    stream<net_axis<WIDTH> >& m_axis_rx_data_n4,
+    stream<ipUdpMeta>& s_axis_tx_meta_n4,
+    stream<net_axis<WIDTH> >& s_axis_tx_data_n4,
 #endif
 
     ap_uint<128> ip_address_n0,
     ap_uint<128> ip_address_n1,
-#ifdef N_NODE_4
+#ifdef RECV_N_NODE_4
     ap_uint<128> ip_address_n2,
     ap_uint<128> ip_address_n3,
+    ap_uint<128> ip_address_n4,
 #endif
 
     double dropEveryNPacket // 0 means no drop
@@ -213,109 +226,171 @@ void simSwitch(
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<double> dis(0.0, 1.0);
-    static ap_uint<24> firstPsn;
-#ifdef N_NODE_4
-    static ipUdpMeta udpMetaN2, udpMetaN3;
-    static bool udpMetaVldN2, udpMetaVldN3 = false;
-    static bool dropPacketN2, dropPacketN3 = false;
-    static uint32_t cntPacketN2, cntPacketN3 = 0;    
+    static bool lockN0 = true, lockN1 = true;
+#ifdef RECV_N_NODE_4
+    static ipUdpMeta udpMetaN2, udpMetaN3, udpMetaN4;
+    static bool udpMetaVldN2 = false, udpMetaVldN3 = false, udpMetaVldN4 = false;
+    static bool dropPacketN2 = false, dropPacketN3 = false, dropPacketN4 = false;
+    static uint32_t cntPacketN2 = 0, cntPacketN3 = 0, cntPacketN4 = 0;  
+    static bool lockN2 = true, lockN3 = true, lockN4 = true;  
 #endif
 
     net_axis<WIDTH> currWordN0, currWordN1;
-#ifdef N_NODE_4
-    net_axis<WIDTH> currWordN2, currWordN3;
+#ifdef RECV_N_NODE_4
+    net_axis<WIDTH> currWordN2, currWordN3, currWordN4;
 #endif
+//     static bool onSend = false;
+//     static uint8_t lock = 0;
+//     static uint8_t port = 0;
 
-    FWDMETA(0);
-    FWDMETA(1);
-#ifdef N_NODE_4
-    FWDMETA(2);
-    FWDMETA(3);
-#endif
+//     if(!onSend){
+//         lock = lock%4;
+//         if(lock==0){
+//             port = 0;
+//         }else if(lock==1){
+//             port = 2;
+//         }else if(lock == 2){
+//             port = 3;
+//         }else{
+//             port = 4;
+//         }
+//         lock += 1;
+//     }
+//     RECVFWMETA(1);
+//     RECVFWDATA(1);
+//     if(port==0){
+//         RECVFWMETA(0);
+//         RECVFWDATA(0);
+//     }
+//     else if(port==2){
+//         RECVFWMETA(2);
+//         RECVFWDATA(2);
+//     }
+//     else if(port==3){
+//         RECVFWMETA(3);
+//         RECVFWDATA(3);
+//     }
+//     else{
+//         RECVFWMETA(4);
+//         RECVFWDATA(4);
+//     }
+//     RECVFWMETA(0);
+//     RECVFWMETA(1);
+// #ifdef RECV_N_NODE_4
+//     RECVFWMETA(2);
+//     RECVFWMETA(3);
+//     RECVFWMETA(4);
+// #endif
 
-    FWDDATA(0);
-    FWDDATA(1);
-#ifdef N_NODE_4
-    FWDDATA(2);
-    FWDDATA(3);
-#endif
+//     RECVFWDATA(0);
+//     RECVFWDATA(1);
+// #ifdef RECV_N_NODE_4
+//     RECVFWDATA(2);
+//     RECVFWDATA(3);
+//     RECVFWDATA(4);
+// #endif
+// 在 simSwitchRecv 内增加
+static ap_uint<3> active = 7;        // 7 = none, 0/2/3/4 = chosen input for dst=1
+static bool meta_sent = false;
+static ap_uint<3> rr = 0;
 
+// 先把各输入的 meta 读入本地，但不立刻 forward meta
+auto try_read_meta = [&](int s){
+    if (s==0 && !s_axis_tx_meta_n0.empty() && !udpMetaVldN0){ s_axis_tx_meta_n0.read(udpMetaN0); udpMetaVldN0=true; }
+    if (s==2 && !s_axis_tx_meta_n2.empty() && !udpMetaVldN2){ s_axis_tx_meta_n2.read(udpMetaN2); udpMetaVldN2=true; }
+    if (s==3 && !s_axis_tx_meta_n3.empty() && !udpMetaVldN3){ s_axis_tx_meta_n3.read(udpMetaN3); udpMetaVldN3=true; }
+    if (s==4 && !s_axis_tx_meta_n4.empty() && !udpMetaVldN4){ s_axis_tx_meta_n4.read(udpMetaN4); udpMetaVldN4=true; }
+};
+
+// 每拍先尝试缓存 meta（不会改变输出顺序）
+try_read_meta(0); try_read_meta(2); try_read_meta(3); try_read_meta(4);
+
+// 选择一个 active（只选择“dst=1 且有包在进行”的输入）
+if (active == 7) {
+    for(int k=0;k<4;k++){
+        int s = (rr + k) % 4;
+        int p = (s==0)?0:(s==1)?2:(s==2)?3:4; // rr:0..3 -> port:0,2,3,4
+        bool vld = (p==0)?udpMetaVldN0:(p==2)?udpMetaVldN2:(p==3)?udpMetaVldN3:udpMetaVldN4;
+        ipUdpMeta m = (p==0)?udpMetaN0:(p==2)?udpMetaN2:(p==3)?udpMetaN3:udpMetaN4;
+        if (vld && m.their_address == ip_address_n1) { active = p; meta_sent=false; rr=(s+1)%4; break; }
+    }
 }
 
+// 若已选中 active，则先发 meta（只一次），再 drain data 直到 last
+if (active != 7) {
+    ipUdpMeta &m = (active==0)?udpMetaN0:(active==2)?udpMetaN2:(active==3)?udpMetaN3:udpMetaN4;
 
-int testSimSwitch(double dropEveryNPacket){
-#pragma HLS inline region off
+    if (!meta_sent) {
+        m_axis_rx_meta_n1.write(m);
+        meta_sent = true;
+    }
 
-    // RX - net module
-    stream<ipUdpMeta> s_axis_rx_meta_n0;
-    stream<net_axis<DATA_WIDTH> > s_axis_rx_data_n0;
-    stream<ipUdpMeta> s_axis_rx_meta_n1;
-    stream<net_axis<DATA_WIDTH> > s_axis_rx_data_n1;
+    // drain data
+    bool data_ok = (active==0)?!s_axis_tx_data_n0.empty():
+                   (active==2)?!s_axis_tx_data_n2.empty():
+                   (active==3)?!s_axis_tx_data_n3.empty():
+                               !s_axis_tx_data_n4.empty();
+    if (data_ok) {
+        net_axis<WIDTH> w;
+        if(active==0) s_axis_tx_data_n0.read(w);
+        else if(active==2) s_axis_tx_data_n2.read(w);
+        else if(active==3) s_axis_tx_data_n3.read(w);
+        else s_axis_tx_data_n4.read(w);
 
-    // TX - net module
-    stream<ipUdpMeta> m_axis_tx_meta_n0;
-    stream<net_axis<DATA_WIDTH> > m_axis_tx_data_n0;
-    stream<ipUdpMeta> m_axis_tx_meta_n1;
-    stream<net_axis<DATA_WIDTH> > m_axis_tx_data_n1;
+        m_axis_rx_data_n1.write(w);
 
-    stream<testForSwitch> recvIbOpcodeFifo_n0;
-    stream<testForSwitch> recvIbOpcodeFifo_n1;
-    ap_uint<128> ip_address_n0, ip_address_n1;
-    ip_address_n0(127, 64) = 0xfe80000000000000;
-    ip_address_n0(63, 0)   = 0x92e2baff0b01d4d2;
-    ip_address_n1(127, 64) = 0xfe80000000000000;
-    ip_address_n1(63, 0)   = 0x92e2baff0b01d4d3;
+        if (w.last) {
+            // 释放该输入的包状态
+            if(active==0) udpMetaVldN0=false;
+            else if(active==2) udpMetaVldN2=false;
+            else if(active==3) udpMetaVldN3=false;
+            else udpMetaVldN4=false;
 
-    ipUdpMeta metaN0 = ipUdpMeta(ip_address_n1, PORT_RMT, PORT_LOC, PKT_LEN);
-    ipUdpMeta metaN1 = ipUdpMeta(ip_address_n0, PORT_RMT, PORT_LOC, PKT_LEN2);
-
-    // write test packets to n0 tx
-    for (int i=0; i<8; i++){
-        m_axis_tx_meta_n0.write(metaN0);
-        for (int j=0; j<PKT_LEN; j+=DATA_WIDTH/8){
-            bool isLast = ((j+DATA_WIDTH/8)>=PKT_LEN) ? true : false;
-            m_axis_tx_data_n0.write(net_axis<DATA_WIDTH>((0x0000<<16)+(i<<8)+j/(DATA_WIDTH/8), lenToKeep(isLast ? PKT_LEN-j : DATA_WIDTH/8), isLast));
+            active = 7;
+            meta_sent = false;
         }
     }
-
-    // write test packets to n1 tx
-    for (int i=0; i<8; i++){
-        m_axis_tx_meta_n1.write(metaN1);
-        for (int j=0; j<PKT_LEN2; j+=DATA_WIDTH/8){
-            bool isLast = ((j+DATA_WIDTH/8)>=PKT_LEN2) ? true : false;
-            m_axis_tx_data_n1.write(net_axis<DATA_WIDTH>((0x0001<<16)+(i<<8)+j/(DATA_WIDTH/8), lenToKeep(isLast ? PKT_LEN2-j : DATA_WIDTH/8), isLast));
-        }
-    }
-
-    for (int i=0; i<CLK_SIM; i++){
-        simSwitch<DATA_WIDTH>(
-            s_axis_rx_meta_n0,
-            s_axis_rx_data_n0,
-            m_axis_tx_meta_n0,
-            m_axis_tx_data_n0,
-            recvIbOpcodeFifo_n0,
-            s_axis_rx_meta_n1,
-            s_axis_rx_data_n1,
-            m_axis_tx_meta_n1,
-            m_axis_tx_data_n1,
-            recvIbOpcodeFifo_n1,
-            ip_address_n0,
-            ip_address_n1,
-            dropEveryNPacket
-        );
-
-        // monitor the n1 rx
-        PRTRXMETA(1);
-        PRTRXDATA(1);
-
-        // monitor the n0 rx
-        PRTRXMETA(0);
-        PRTRXDATA(0);
-
-    }
-
-    return 0;
 }
 
+// 反馈方向 src=1 -> dst=0 建议单独通道处理（输出口不同，可以并行），同样做到“meta 与 opcode 同步”
+static bool fb_active = false;
+static bool fb_meta_sent = false;
+static ipUdpMeta fb_meta;
+static testForSwitch fb_op;
 
+if (!fb_active) {
+    // 等 meta + opcode 都就绪才启动一个反馈包
+    if (!s_axis_tx_meta_n1.empty() && !recvIbOpcodeFifo_n1.empty()) {
+        // 先窥探 meta，确认它确实是发往 n0 的反馈包（可选）
+        // 这里简单起见直接读出来再判断
+        s_axis_tx_meta_n1.read(fb_meta);
+        recvIbOpcodeFifo_n1.read(fb_op);
 
+        // 若不是发往 n0，你可以把它走普通路径（此处略）
+        // 假设反馈包一定发往 n0：
+        fb_active = true;
+        fb_meta_sent = false;
+    }
+}
+
+if (fb_active) {
+    if (!fb_meta_sent) {
+        m_axis_rx_meta_n0.write(fb_meta);
+        txIbOpcodeFifo_n0.write(fb_op);   // 和 meta 同步发出
+        fb_meta_sent = true;
+    }
+
+    // 连续 drain data 直到 last（包边界不破坏）
+    if (!s_axis_tx_data_n1.empty()) {
+        net_axis<WIDTH> w;
+        s_axis_tx_data_n1.read(w);
+        m_axis_rx_data_n0.write(w);
+
+        if (w.last) {
+            fb_active = false;
+            fb_meta_sent = false;
+        }
+    }
+}
+
+}

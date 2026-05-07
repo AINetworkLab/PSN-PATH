@@ -35,7 +35,6 @@ using namespace hls;
 #define PKT_LEN  64
 #define PKT_LEN2 64
 #define CLK_SIM 5000
-#define ALLPKGNUM 1000
 
 #ifdef N_NODE_4
 #define FWDMETA(srcNode)                                                        \
@@ -64,10 +63,7 @@ using namespace hls;
         cntPacketN##srcNode++;                                                  \
         double loss_r=dis(gen);                                                 \
         /*std::cout<<"loss_r:\t"<<loss_r<<std::endl;*/                              \
-        if(ib_opN##srcNode.op == 0x06){\
-            firstPsn = ib_opN##srcNode.psn;\
-        }\
-        if(loss_r<dropEveryNPacket && ib_opN##srcNode.op == 0x07 && ib_opN##srcNode.retr==0 && ib_opN##srcNode.psn - firstPsn + 1 < ALLPKGNUM - 4){              \
+        if(loss_r<dropEveryNPacket && ib_opN##srcNode.op == 0x07 && ib_opN##srcNode.retr==0){              \
             std::cout<<"发生丢失:\t"<<ib_opN##srcNode.psn<<std::endl;            \
             dropPacketN##srcNode = true;                                        \
         }else{                                                                  \
@@ -207,13 +203,12 @@ void simSwitch(
 
     static ipUdpMeta udpMetaN0, udpMetaN1;
     static testForSwitch ib_opN0,ib_opN1;
-    static bool udpMetaVldN0 = false, udpMetaVldN1 = false;
-    static bool dropPacketN0 = false, dropPacketN1 = false;
-    static uint32_t cntPacketN0 = 0, cntPacketN1 = 0;
+    static bool udpMetaVldN0, udpMetaVldN1 = false;
+    static bool dropPacketN0, dropPacketN1 = false;
+    static uint32_t cntPacketN0, cntPacketN1 = 0;
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<double> dis(0.0, 1.0);
-    static ap_uint<24> firstPsn;
 #ifdef N_NODE_4
     static ipUdpMeta udpMetaN2, udpMetaN3;
     static bool udpMetaVldN2, udpMetaVldN3 = false;
@@ -241,81 +236,5 @@ void simSwitch(
 #endif
 
 }
-
-
-int testSimSwitch(double dropEveryNPacket){
-#pragma HLS inline region off
-
-    // RX - net module
-    stream<ipUdpMeta> s_axis_rx_meta_n0;
-    stream<net_axis<DATA_WIDTH> > s_axis_rx_data_n0;
-    stream<ipUdpMeta> s_axis_rx_meta_n1;
-    stream<net_axis<DATA_WIDTH> > s_axis_rx_data_n1;
-
-    // TX - net module
-    stream<ipUdpMeta> m_axis_tx_meta_n0;
-    stream<net_axis<DATA_WIDTH> > m_axis_tx_data_n0;
-    stream<ipUdpMeta> m_axis_tx_meta_n1;
-    stream<net_axis<DATA_WIDTH> > m_axis_tx_data_n1;
-
-    stream<testForSwitch> recvIbOpcodeFifo_n0;
-    stream<testForSwitch> recvIbOpcodeFifo_n1;
-    ap_uint<128> ip_address_n0, ip_address_n1;
-    ip_address_n0(127, 64) = 0xfe80000000000000;
-    ip_address_n0(63, 0)   = 0x92e2baff0b01d4d2;
-    ip_address_n1(127, 64) = 0xfe80000000000000;
-    ip_address_n1(63, 0)   = 0x92e2baff0b01d4d3;
-
-    ipUdpMeta metaN0 = ipUdpMeta(ip_address_n1, PORT_RMT, PORT_LOC, PKT_LEN);
-    ipUdpMeta metaN1 = ipUdpMeta(ip_address_n0, PORT_RMT, PORT_LOC, PKT_LEN2);
-
-    // write test packets to n0 tx
-    for (int i=0; i<8; i++){
-        m_axis_tx_meta_n0.write(metaN0);
-        for (int j=0; j<PKT_LEN; j+=DATA_WIDTH/8){
-            bool isLast = ((j+DATA_WIDTH/8)>=PKT_LEN) ? true : false;
-            m_axis_tx_data_n0.write(net_axis<DATA_WIDTH>((0x0000<<16)+(i<<8)+j/(DATA_WIDTH/8), lenToKeep(isLast ? PKT_LEN-j : DATA_WIDTH/8), isLast));
-        }
-    }
-
-    // write test packets to n1 tx
-    for (int i=0; i<8; i++){
-        m_axis_tx_meta_n1.write(metaN1);
-        for (int j=0; j<PKT_LEN2; j+=DATA_WIDTH/8){
-            bool isLast = ((j+DATA_WIDTH/8)>=PKT_LEN2) ? true : false;
-            m_axis_tx_data_n1.write(net_axis<DATA_WIDTH>((0x0001<<16)+(i<<8)+j/(DATA_WIDTH/8), lenToKeep(isLast ? PKT_LEN2-j : DATA_WIDTH/8), isLast));
-        }
-    }
-
-    for (int i=0; i<CLK_SIM; i++){
-        simSwitch<DATA_WIDTH>(
-            s_axis_rx_meta_n0,
-            s_axis_rx_data_n0,
-            m_axis_tx_meta_n0,
-            m_axis_tx_data_n0,
-            recvIbOpcodeFifo_n0,
-            s_axis_rx_meta_n1,
-            s_axis_rx_data_n1,
-            m_axis_tx_meta_n1,
-            m_axis_tx_data_n1,
-            recvIbOpcodeFifo_n1,
-            ip_address_n0,
-            ip_address_n1,
-            dropEveryNPacket
-        );
-
-        // monitor the n1 rx
-        PRTRXMETA(1);
-        PRTRXDATA(1);
-
-        // monitor the n0 rx
-        PRTRXMETA(0);
-        PRTRXDATA(0);
-
-    }
-
-    return 0;
-}
-
 
 

@@ -32,7 +32,7 @@ EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "../axi_utils.hpp"
 #include "ib_transport_protocol.hpp"
 #include "retransmitter/retransmitter.hpp"
-#include <rocev2_config.hpp> //defines MAX_QPS
+#include "rocev2_config.hpp" //defines MAX_QPS
 
 
 using namespace hls;

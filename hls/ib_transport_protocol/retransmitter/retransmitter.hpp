@@ -321,18 +321,18 @@ void process_retransmissions(
 			rx2retrans_upd.read(update);
 			pointerReqFifo.write(pointerReq(update.qpn, true)); // enquire whether we have previous req for this qpn
 			rt_state = UPDATE_0;
-			std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: updating " << update.latest_acked_req << std::endl;
+			// std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: updating " << update.latest_acked_req << std::endl;
 		}
 		else if (!rx2retrans_req.empty())
 		{
 			rx2retrans_req.read(retrans);
-			std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: RX Retransmit triggered!!" << std::endl;
+			// std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: RX Retransmit triggered!!" << std::endl;
 			pointerReqFifo.write(pointerReq(retrans.qpn)); 		// enquire whether we have previous req for this qpn
 			rt_state = RETRANS_0;
 		}
 		else if (!timer2retrans_req.empty())
 		{
-			std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: TIMER Retransmit triggered!!" << std::endl;
+			// std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: TIMER Retransmit triggered!!" << std::endl;
 			timer2retrans_req.read(retrans);
 			// Uses always head psn
 			pointerReqFifo.write(pointerReq(retrans.qpn)); 		// enquire whether we have previous req for this qpn
@@ -344,7 +344,7 @@ void process_retransmissions(
 			tx2retrans_insertRequest.read(insert);
 			pointerReqFifo.write(pointerReq(insert.qpn, true));	// enquire whether we have previous req for this qpn
 			rt_state = INSERT_0;
-			std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: inserting new meta, psn " << std::hex << insert.psn << ", occupying pointer " << newMetaIdx << std::endl;
+			// std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: inserting new meta, psn " << std::hex << insert.psn << ", occupying pointer " << newMetaIdx << std::endl;
 		}
 		break;
 	case INSERT_0:
@@ -360,7 +360,7 @@ void process_retransmissions(
 				metaReqFifo.write(retransMetaReq(newMetaIdx, retransMetaEntry(insert)));
 				pointerUpdFifo.write(pointerUpdate(insert.qpn, ptrMeta));
 				rt_state = MAIN;
-				std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: inserting new entry at qpn " << insert.qpn << ", last " << insert.lst << std::endl;
+				// std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: inserting new entry at qpn " << insert.qpn << ", last " << insert.lst << std::endl;
 			}
 			else
 			{
@@ -369,7 +369,7 @@ void process_retransmissions(
 				// Update the tail pointer to the next index in `Retrans Meta Table`
 				ptrMeta.tail = newMetaIdx;
 				rt_state = INSERT_1;
-				std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: appending entry at qpn " << insert.qpn << std::endl;
+				// std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: appending entry at qpn " << insert.qpn << std::endl;
 			}
 		}
 		break;
@@ -383,11 +383,11 @@ void process_retransmissions(
 	case UPDATE_0:
 		if (!pointerRspFifo.empty())
 		{
-            std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_0 init entry" << std::endl;
+            // std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_0 init entry" << std::endl;
 			pointerRspFifo.read(ptrMeta);
 			if (ptrMeta.valid)
 			{
-                std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_0 valid meta entry" << std::endl;
+                // std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_0 valid meta entry" << std::endl;
 				// Enquire the first uncleared index (head) in `Retrans Meta Table`
 				metaReqFifo.write(retransMetaReq(ptrMeta.head));
 				curr = ptrMeta.head;
@@ -396,7 +396,7 @@ void process_retransmissions(
 			else
 			{
 				// this should not happen
-				std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_0 invalid meta entry" << std::endl;
+				// std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_0 invalid meta entry" << std::endl;
 				// Release lock
 				pointerUpdFifo.write(pointerUpdate(update.qpn, ptrMeta));
 				rt_state = MAIN;
@@ -410,7 +410,7 @@ void process_retransmissions(
 
             if(!meta.valid) {
                 // Invalid state
-                std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_1 invalid state" << std::endl;
+                // std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_1 invalid state" << std::endl;
                 break;
             } else {
                 // Address forwarding
@@ -418,7 +418,7 @@ void process_retransmissions(
                 {
                     retrans2rx_init.write(retransRdInit(meta.localAddr, meta.lst, meta.host));
 
-                    std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_1 forwarding local address, laddr " << meta.localAddr << ", last" << meta.lst << std::endl;
+                    // std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_1 forwarding local address, laddr " << meta.localAddr << ", last" << meta.lst << std::endl;
                 }
 
                 // Packet update
@@ -431,7 +431,7 @@ void process_retransmissions(
                     // Update meta table
                     metaReqFifo.write(retransMetaReq(ptrMeta.head, retransMetaEntry(meta)));
 
-                    std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_1 packet update, psn " << meta.psn << ", laddr " << meta.localAddr << ", raddr " << meta.remoteAddr << ", len " << meta.length << std::endl;
+                    // std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_1 packet update, psn " << meta.psn << ", laddr " << meta.localAddr << ", raddr " << meta.remoteAddr << ", len " << meta.length << std::endl;
                 } else {
                     // Move index
                     ptrMeta.head = meta.next;
@@ -441,7 +441,7 @@ void process_retransmissions(
                     releaseFifo.write(curr);
                     curr = meta.next;
 
-                    std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_1 ack update, psn " << meta.psn << std::endl;
+                    // std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_1 ack update, psn " << meta.psn << std::endl;
                 }
             }
 
@@ -454,7 +454,7 @@ void process_retransmissions(
 	case RETRANS_0:
 		if (!pointerRspFifo.empty())
 		{
-			std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: NAK, retransmitting qpn " << retrans.qpn << std::endl;
+			// std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: NAK, retransmitting qpn " << retrans.qpn << std::endl;
 			pointerRspFifo.read(ptrMeta);
 			rt_state = MAIN;
 			if (ptrMeta.valid)
@@ -478,7 +478,7 @@ void process_retransmissions(
 				{
 					// this should ideally not happen
 					// requested retransmission psn not stored
-					std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state RETRANS_1 trying to retransmit psn that is ACKed" << std::endl;
+					// std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state RETRANS_1 trying to retransmit psn that is ACKed" << std::endl;
 					rt_state = MAIN;
 				}
 				else
@@ -490,7 +490,7 @@ void process_retransmissions(
 				// check if we should start retransmitting
 				if (meta.psn == retrans.psn)
 				{
-					std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: retransmitting psn " << meta.psn << std::endl;
+					// std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: retransmitting psn " << meta.psn << std::endl;
 					retrans2event.write(retransEvent(meta.opCode, retrans.qpn, meta.localAddr, meta.remoteAddr, meta.length, meta.psn, meta.lst, meta.offs));
 					if (!meta.isTail)
 					{
@@ -519,7 +519,7 @@ void process_retransmissions(
 					metaReqFifo.write(retransMetaReq(meta.next));
 					rt_state = RETRANS_2;
 				}
-				std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: retransmitting psn " << meta.psn << std::endl;
+				// std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: retransmitting psn " << meta.psn << std::endl;
 				retrans2event.write(retransEvent(meta.opCode, retrans.qpn, meta.localAddr, meta.remoteAddr, meta.length, meta.psn, meta.lst, meta.offs));
 			}
 		}
@@ -527,7 +527,7 @@ void process_retransmissions(
 	case TIMER_RETRANS_0:
 		if (!pointerRspFifo.empty())
 		{
-			std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: timed out, retransmitting qpn " << retrans.qpn << std::endl;
+			// std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: timed out, retransmitting qpn " << retrans.qpn << std::endl;
 			pointerRspFifo.read(ptrMeta);
 			if (ptrMeta.valid)
 			{

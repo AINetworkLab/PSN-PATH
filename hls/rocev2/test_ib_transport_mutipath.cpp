@@ -64,6 +64,7 @@ using namespace hls;
     int sendPkgNum_n##ninst;                                             \
     bool isrecv_n##ninst;                                                \
     int disOrderCount_n##ninst;                                            \
+    static stream<testForSwitch> ibOpCodeFifo_n##ninst;\
 
 #define IBTRUN(ninst)                               \
     ib_transport_protocol<DATA_WIDTH, ninst>(       \
@@ -94,53 +95,53 @@ using namespace hls;
     stream<net_axis<DATA_WIDTH> > s_axis_rx_data_n##port;   \
     stream<ipUdpMeta> m_axis_tx_meta_n##port;               \
     stream<net_axis<DATA_WIDTH> > m_axis_tx_data_n##port;   \
-    static stream<testForSwitch> ibOpCodeFifo_n##port;      \
+    static stream<testForSwitch> txIbOpCodeFifo_n##port;      \
 
-#define SWITCHRUN(dropEveryNPacket)                 \
+#define SWITCHRUN(p0,p1,dropEveryNPacket)                 \
     simSwitch<DATA_WIDTH>(                          \
-        s_axis_rx_meta_n0,                          \
-        s_axis_rx_data_n0,                          \
-        m_axis_tx_meta_n0,                          \
-        m_axis_tx_data_n0,                          \
-        ibOpCodeFifo_n0,                            \
-        s_axis_rx_meta_n1,                          \
-        s_axis_rx_data_n1,                          \
-        m_axis_tx_meta_n1,                          \
-        m_axis_tx_data_n1,                          \
-        ibOpCodeFifo_n1,                            \
+        m_axis_tx_meta_n##p0,                          \
+        m_axis_tx_data_n##p0,                          \
+        s_axis_rx_meta_n##p0,                          \
+        s_axis_rx_data_n##p0,                          \
+        txIbOpCodeFifo_n##p0,                            \
+        m_axis_tx_meta_n##p1,                          \
+        m_axis_tx_data_n##p1,                          \
+        s_axis_rx_meta_n##p1,                          \
+        s_axis_rx_data_n##p1,                          \
+        txIbOpCodeFifo_n##p1,                            \
         ipAddrN0,                                   \
         ipAddrN1,                                   \
         dropEveryNPacket                           \
     );
 
-#define SWITCHRUNSEND(dropEveryNPacket)                 \
+#define SWITCHRUNSEND(s0,s1,s2,s3,s4,dropEveryNPacket)                 \
     simSwitchSend<DATA_WIDTH>(                          \
-        s_axis_rx_meta_n0,                          \
-        s_axis_rx_data_n0,                          \
-        m_axis_tx_meta_n0,                          \
-        m_axis_tx_data_n0,                          \
-        recvIbOpcodeFifo_n0,                        \
-        txIbOpcodeFifo_n0,                            \
-        s_axis_rx_meta_n1,                          \
-        s_axis_rx_data_n1,                          \
-        m_axis_tx_meta_n1,                          \
-        m_axis_tx_data_n1,                          \
-        txibOpCodeFifo_n1,                            \
-        s_axis_rx_meta_n2,                          \
-        s_axis_rx_data_n2,                          \
-        m_axis_tx_meta_n2,                          \
-        m_axis_tx_data_n2,                          \
-        txIbOpCodeFifo_n2,                            \
-        s_axis_rx_meta_n3,                          \
-        s_axis_rx_data_n3,                          \
-        m_axis_tx_meta_n3,                          \
-        m_axis_tx_data_n3,                          \
-        txIbOpCodeFifo_n3,                            \
-        s_axis_rx_meta_n4,                          \
-        s_axis_rx_data_n4,                          \
-        m_axis_tx_meta_n4,                          \
-        m_axis_tx_data_n4,                          \
-        txIbOpCodeFifo_n4,                            \
+        s_axis_rx_meta_n##s0,                          \
+        s_axis_rx_data_n##s0,                          \
+        m_axis_tx_meta_n##s0,                          \
+        m_axis_tx_data_n##s0,                          \
+        ibOpCodeFifo_n##s0,                        \
+        txIbOpCodeFifo_n##s0,                            \
+        s_axis_rx_meta_n##s1,                          \
+        s_axis_rx_data_n##s1,                          \
+        m_axis_tx_meta_n##s1,                          \
+        m_axis_tx_data_n##s1,                          \
+        txIbOpCodeFifo_n##s1,                            \
+        s_axis_rx_meta_n##s2,                          \
+        s_axis_rx_data_n##s2,                          \
+        m_axis_tx_meta_n##s2,                          \
+        m_axis_tx_data_n##s2,                          \
+        txIbOpCodeFifo_n##s2,                            \
+        s_axis_rx_meta_n##s3,                          \
+        s_axis_rx_data_n##s3,                          \
+        m_axis_tx_meta_n##s3,                          \
+        m_axis_tx_data_n##s3,                          \
+        txIbOpCodeFifo_n##s3,                            \
+        s_axis_rx_meta_n##s4,                          \
+        s_axis_rx_data_n##s4,                          \
+        m_axis_tx_meta_n##s4,                          \
+        m_axis_tx_data_n##s4,                          \
+        txIbOpCodeFifo_n##s4,                            \
         ipAddrN0,                                   \
         ipAddrN1,                                   \
         ipAddrN2,                                   \
@@ -150,34 +151,37 @@ using namespace hls;
     );
 
 
-#define SWITCHRUNRECV(dropEveryNPacket)                 \
+#define SWITCHRUNRECV(r0,r1,r2,r3,r4,dropEveryNPacket,reorderRate)                 \
     simSwitchRecv<DATA_WIDTH>(                          \
-        s_axis_rx_meta_n0,                          \
-        s_axis_rx_data_n0,                          \
-        m_axis_tx_meta_n0,                          \
-        m_axis_tx_data_n0,                          \
-        s_axis_rx_meta_n1,                          \
-        s_axis_rx_data_n1,                          \
-        m_axis_tx_meta_n1,                          \
-        m_axis_tx_data_n1,                          \
-        s_axis_rx_meta_n2,                          \
-        s_axis_rx_data_n2,                          \
-        m_axis_tx_meta_n2,                          \
-        m_axis_tx_data_n2,                          \
-        s_axis_rx_meta_n3,                          \
-        s_axis_rx_data_n3,                          \
-        m_axis_tx_meta_n3,                          \
-        m_axis_tx_data_n3,                          \
-        s_axis_rx_meta_n4,                          \
-        s_axis_rx_data_n4,                          \
-        m_axis_tx_meta_n4,                          \
-        m_axis_tx_data_n4,                          \
+        s_axis_rx_meta_n##r0,                          \
+        s_axis_rx_data_n##r0,                          \
+        m_axis_tx_meta_n##r0,                          \
+        m_axis_tx_data_n##r0,                          \
+        ibOpCodeFifo_n##r1,\
+        txIbOpCodeFifo_n##r0,\
+        s_axis_rx_meta_n##r1,                          \
+        s_axis_rx_data_n##r1,                          \
+        m_axis_tx_meta_n##r1,                          \
+        m_axis_tx_data_n##r1,                          \
+        s_axis_rx_meta_n##r2,                          \
+        s_axis_rx_data_n##r2,                          \
+        m_axis_tx_meta_n##r2,                          \
+        m_axis_tx_data_n##r2,                          \
+        s_axis_rx_meta_n##r3,                          \
+        s_axis_rx_data_n##r3,                          \
+        m_axis_tx_meta_n##r3,                          \
+        m_axis_tx_data_n##r3,                          \
+        s_axis_rx_meta_n##r4,                          \
+        s_axis_rx_data_n##r4,                          \
+        m_axis_tx_meta_n##r4,                          \
+        m_axis_tx_data_n##r4,                          \
         ipAddrN0,                                   \
         ipAddrN1,                                   \
         ipAddrN2,                                   \
         ipAddrN3,                                   \
         ipAddrN4,                                   \
-        dropEveryNPacket                           \
+        dropEveryNPacket,                           \
+        reorderRate                                 \
     );
 
 #define DRAMRUN(ninst)                                                                    \
@@ -185,8 +189,8 @@ if (!m_axis_mem_write_cmd_n##ninst.empty() && !writeCmdReady[ninst]){           
     m_axis_mem_write_cmd_n##ninst.read(writeCmd[ninst]);                                  \
     writeCmdReady[ninst] = true;                                                          \
     writeRemainLen[ninst] = writeCmd[ninst].len;                                          \
-/*   std::cout << "[Memory]: Write command, address: " << writeCmd[ninst].addr              \
-        << ", length: " << std::dec <<writeCmd[ninst].len << std::endl;*/                    \
+    /*std::cout << "[Memory]: Write command, address: " << writeCmd[ninst].addr              \
+        << ", length: " << std::dec <<writeCmd[ninst].len << std::endl; */                  \
 }                                                                                         \
 if (writeCmdReady[ninst] && !m_axis_mem_write_data_n##ninst.empty()){                     \
     net_axis<DATA_WIDTH> currWord;                                                        \
@@ -210,12 +214,20 @@ if (!m_axis_rx_ack_meta_n##ninst.empty()){                                      
  //       << currWord.data << std::dec << std::endl;                                        \
 
 
- void test(int sendPkgNum, double networkLoss, std::vector<double> &Times, std::vector<double> &goodputs, std::vector<double> &SRNIC_Times, std::vector<double> &SRNIC_goodputs){
+ void test(int sendPkgNum, double networkLoss, double reorderRate, std::vector<double> &Times, std::vector<double> &goodputs){
     // testSimSwitch(8); // drop one packet for every 8; 0 means no drop
 
     // switch ports
     SWITCHPORT(0);
     SWITCHPORT(1);
+    SWITCHPORT(2);
+    SWITCHPORT(3);
+    SWITCHPORT(4);
+    SWITCHPORT(5);
+    SWITCHPORT(6);
+    SWITCHPORT(7);
+    SWITCHPORT(8);
+    SWITCHPORT(9);
 
     // interfaces
     IBTPORT(0);
@@ -231,17 +243,21 @@ if (!m_axis_rx_ack_meta_n##ninst.empty()){                                      
     std::vector<ackMeta> ackMeta(2);
 
     // ipAddr
-    ap_uint<128> ipAddrN0, ipAddrN1;
+    ap_uint<128> ipAddrN0, ipAddrN1, ipAddrN2, ipAddrN3, ipAddrN4;
     ipAddrN0(127, 64) = 0xfe80000000000000;
     ipAddrN0(63, 0)   = 0x92e2baff0b01d4d2;
     ipAddrN1(127, 64) = 0xfe80000000000000;
     ipAddrN1(63, 0)   = 0x92e2baff0b01d4d3;
+    ipAddrN2 = 0;
+    ipAddrN3 = 0;
+    ipAddrN4 = 0;
+
 
     // Create qp ctx
     qpContext ctxN00 = qpContext(READY_RECV, 0x00, 0xac701e, 0x2a19d6, 0, 0x00);
-    qpContext ctxN01 = qpContext(READY_RECV, 0x01, 0xbc701e, 0x3a19d6, 0, 0x00);
+    qpContext ctxN01 = qpContext(READY_RECV, 0x01, 0x000000, 0x3a19d6, 0, 0x00);
 
-    qpContext ctxN10 = qpContext(READY_RECV, 0x00, 0x3a19d6, 0xbc701e, 0, 0x00);
+    qpContext ctxN10 = qpContext(READY_RECV, 0x00, 0x3a19d6, 0x000000, 0, 0x00);
     qpContext ctxN11 = qpContext(READY_RECV, 0x01, 0x2a19d6, 0xac701e, 0, 0x00);
     
     ifConnReq connInfoN0 = ifConnReq(1, 0, ipAddrN1, 5000);
@@ -317,7 +333,7 @@ if (!m_axis_rx_ack_meta_n##ninst.empty()){                                      
     //         first = false;
     //     }
     // }
-    while (count < 400000)
+    while (count < 4000000)
     {
         if(!first){
             break;
@@ -328,8 +344,23 @@ if (!m_axis_rx_ack_meta_n##ninst.empty()){                                      
             count++;
             end_count++; 
         }
-        for(int i=0;i<=t;i++){
-            SWITCHRUN(networkLoss);
+        for(int i=0;i<=10;i++){
+            SWITCHRUNSEND(0,2,4,6,8,0);
+            SWITCHRUN(2,3,0);
+            SWITCHRUN(4,5,networkLoss);
+            SWITCHRUN(6,7,networkLoss);
+            SWITCHRUN(8,9,0); 
+            SWITCHRUNRECV(3,1,5,7,9,0,reorderRate);           
+        }
+        for(int i=0;i<t;++i){
+            SWITCHRUNSEND(0,2,4,6,8,0);
+            SWITCHRUN(2,3,0);
+            SWITCHRUN(4,5,networkLoss);
+            SWITCHRUN(6,7,networkLoss);
+            SWITCHRUN(8,9,0); 
+        }
+        for(int i=0;i<t;++i){
+            SWITCHRUNRECV(3,1,5,7,9,0,reorderRate); 
         }
         std::cout<<"---------------发送方数据到达------------"<<std::endl;
         for(int i=0;i<=t;i++){
@@ -362,36 +393,27 @@ if (!m_axis_rx_ack_meta_n##ninst.empty()){                                      
     std::cout<<"goodput:"<<std::dec<<8*sendPkgNum_n0/((end_cycle*(3.2)/1000)/8)<<"Gbps"<<std::endl;
     goodputs.push_back(8*sendPkgNum_n0/((end_cycle*(3.2)/1000)/8));
     std::cout<<"接收包乱序数目:"<<disOrderCount_n1<<std::endl;
-    SRNIC_Times.push_back(end_Time/8+disOrderCount_n1*PCIE_latency);
-    std::cout<<"SRNIC传输时延:"<<end_Time/8+disOrderCount_n1*PCIE_latency<<std::endl;
-    std::cout<<"SRNICgoodput:"<<std::dec<<8*sendPkgNum_n0/((end_cycle*(3.2)/1000)/8 + disOrderCount_n1*PCIE_latency)<<"Gbps"<<std::endl;
-    SRNIC_goodputs.push_back(8*sendPkgNum_n0/((end_cycle*(3.2)/1000)/8 + disOrderCount_n1*PCIE_latency));
 }
 int main(int argc, char* argv[]){
     // test(10,0.1);
     std::vector<double> Times;
     std::vector<double> goodputs;
-    std::vector<double> SRNIC_Times;
-    std::vector<double> SRNIC_goodputs;
     int k = 1;  //循环次数,测量平均值
-    double p_loss = 0.004;  //网络丢包率
-    int pkgNum = 1000;  //数据包数目,每个数据包1KB.
+    double p_loss = 0.01;  //网络丢包率
+    double reorder = 0.1;
+    int pkgNum = ALLPKGNUM;  //数据包数目,每个数据包1KB.
     for(int i=1;i<=k;i++){
-        test(pkgNum,p_loss,Times,goodputs,SRNIC_Times,SRNIC_goodputs);
+        test(pkgNum,p_loss,reorder,Times,goodputs);
     }
     
     double Times_Sum = std::accumulate(Times.begin(),Times.end(),0.0);
     std::cout<<k<<"次实验平均传输时延:"<<Times_Sum/k<<"微秒"<<std::endl;
-    double SRNIC_Times_Sum = std::accumulate(SRNIC_Times.begin(),SRNIC_Times.end(),0.0);
     std::vector<double>::iterator Times_max_iter = std::max_element(Times.begin(),Times.end());
     double Times_max = *Times_max_iter;
     std::cout<<"最长时延:"<<Times_max<<std::endl;
     double goodputs_Sum = std::accumulate(goodputs.begin(),goodputs.end(),0.0);
-    double SRNIC_goodputs_Sum = std::accumulate(SRNIC_goodputs.begin(),SRNIC_goodputs.end(),0.0);
     std::cout<<k<<"次试验平均有效吞吐量为"<<goodputs_Sum/k<<" Gbps"<<std::endl;
     std::cout<<Times_Sum/k<<"\t"<<goodputs_Sum/k<<std::endl;
-    std::cout<<"SRNIC平均传输时延:"<<(SRNIC_Times_Sum/k)<<" 微秒"<<std::endl;
-    std::cout<<"SRNIC平均有效吞吐:"<<(SRNIC_goodputs_Sum/k)<<" Gbps"<<std::endl;
 
     return 0;
 }

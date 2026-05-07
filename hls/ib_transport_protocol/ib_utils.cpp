@@ -53,3 +53,7 @@ bool checkIfRethHeader(ibOpCode code)
 	return (code == RC_RDMA_WRITE_ONLY  || code == RC_RDMA_WRITE_FIRST ||
 			code == RC_RDMA_READ_REQUEST);
 }
+
+bool checkIfSAckHeader(ibOpCode code){
+	return code == RC_SACK;
+}

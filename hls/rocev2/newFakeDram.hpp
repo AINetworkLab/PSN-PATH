@@ -105,7 +105,7 @@ public:
 				idx = 0;
 			}
 		} while(lengthCount != cmd.len);
-		std::cout << "[Memory]: Read data length: " << std::dec << lengthCount << std::endl;
+		// std::cout << "[Memory]: Read data length: " << std::dec << lengthCount << std::endl;
 	}
   /*
    void processRead(memCmd cmd, hls::stream<net_axis<WIDTH> >& dataOut)

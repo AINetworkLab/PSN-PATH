@@ -30,7 +30,7 @@ EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "../axi_utils.hpp"
 #include "../ib_transport_protocol/ib_transport_protocol.hpp"
-#include <rocev2_config.hpp> //defines MAX_QPS
+#include "rocev2_config.hpp" //defines MAX_QPS
 
 //PSN, page 293, 307, 345
 struct stateTableEntry
@@ -184,7 +184,9 @@ void state_table(
 		qpi2stateTable_upd_req.read(ifRequest);
 		if (ifRequest.write)
 		{
+		#ifdef DEBUG
 			std::cout << std::hex << "[STATE TABLE " << INSTID << "]: setup new connection, psn " << ifRequest.remote_psn << std::endl;
+		#endif
 			//state_table[ifRequest.qpn].state = ifRequest.newState;
 			//state_table[ifRequest.qpn].prevOpCode = RC_RDMA_WRITE_LAST;
 			state_table[ifRequest.qpn].resp_epsn = ifRequest.local_psn;
