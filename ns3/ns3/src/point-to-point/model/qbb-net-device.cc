@@ -170,6 +170,7 @@ int RdmaEgressQueue::GetNextQindex(bool paused[]) {
         if (m_qpGrp->IsQpFinished((qIndex + m_rrlast) % fcount)) continue;
         Ptr<RdmaQueuePair> qp = m_qpGrp->Get((qIndex + m_rrlast) % fcount);
         bool cond1 = !paused[qp->m_pg];
+        uint64_t bytesLeft = qp->GetBytesLeft();
         bool hasOrnicRetrans =
             qp->ornic.enabled &&
             !qp->ornic.pendingRetrans.empty();
@@ -181,7 +182,7 @@ int RdmaEgressQueue::GetNextQindex(bool paused[]) {
         bool cond_window_allowed =
             hasRetransToSend ||
             (!qp->IsWinBound() && (!qp->irn.m_enabled || qp->CanIrnTransmit(m_mtu)));
-        bool cond2 = ((qp->GetBytesLeft() > 0 || hasRetransToSend) && cond_window_allowed);
+        bool cond2 = ((bytesLeft > 0 || hasRetransToSend) && cond_window_allowed);
 
         if (ShouldTraceQpScheduling(qp, m_mtu)) {
             uint64_t win = qp->GetWin();

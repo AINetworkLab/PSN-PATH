@@ -32,6 +32,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -49,6 +50,7 @@
 #include "ns3/letflow-routing.h"
 #include "ns3/packet.h"
 #include "ns3/point-to-point-helper.h"
+#include "ns3/psn-path-score.h"
 #include "ns3/qbb-helper.h"
 #include "ns3/qbb-net-device.h"
 #include "ns3/rdma-hw.h"
@@ -163,25 +165,31 @@ uint32_t buffer_size = 0;  // 0 to set buffer size automatically
 // Added from Here
 double load = 10.0;
 int enable_irn = 0;
+uint32_t irn_bdp = 0;  // Zero selects the topology-derived network BDP.
 int enable_psn_path = 0;
 int enable_path_select = 0;
 int enable_path_switch = 0;
 int enable_path_aware_retrans = 0;
 int enable_rx_ooo_nack = 0;
 int enable_tx_nack_goback = 0;
-uint64_t tx_nack_retrans_interval_ns = 0;
 int enable_bitmap_retrans = 0;
 int enable_falcon = 0;
 int enable_ornic = 0;
-double falcon_retrans_rtt_k = 0.0;
+double falcon_retrans_rtt_k = 1.0;
+uint32_t falcon_ooo_distance_threshold = 0;
 uint32_t bitmap_retrans_size = BITMAP_SIZE;
 uint64_t bitmap_retrans_timeout_ns = 0;
-uint64_t falcon_rx_send_delay_ns = 0;
-uint64_t ornic_rx_send_delay_ns = 0;
-double ornic_bw_gbps = 0.0;
-uint32_t psn_path_k = 4;
-double psn_path_beta = 1.0;
-uint64_t psn_path_gap_timeout_ns = 0;
+double ornic_otd = -1.0;  // Unset; required when ORNIC is enabled.
+uint32_t psn_path_k = 0;
+double psn_path_beta = PsnPathScore::UnsetThreshold();
+bool psn_path_normalize_score = false;
+uint32_t psn_path_base_port = 0;
+uint32_t psn_path_offset = 0;
+double psn_path_eval_interval_us = 0;
+double psn_path_t_explore = PsnPathScore::UnsetThreshold();
+double psn_path_t_remove = PsnPathScore::UnsetThreshold();
+double psn_path_normalized_t_explore = PsnPathScore::UnsetThreshold();
+double psn_path_normalized_t_remove = PsnPathScore::UnsetThreshold();
 int random_seed = 1;  // change this randomly if you want random expt
 
 uint64_t maxRtt, maxBdp;
@@ -1621,15 +1629,51 @@ int main(int argc, char *argv[]) {
                 conf >> v;
                 enable_irn = v;
                 std::cerr << "ENABLE_IRN\t\t" << enable_irn << "\n";
+            } else if (key == "IRN_BDP") {
+                if (!(conf >> irn_bdp)) NS_FATAL_ERROR("IRN_BDP requires a byte count");
+                std::cerr << key << "\t" << irn_bdp << "\n";
             } else if (key.compare("PSN_PATH_K") == 0) {
-                conf >> psn_path_k;
+                if (!(conf >> psn_path_k) || psn_path_k == 0 || psn_path_k > UINT16_MAX)
+                    NS_FATAL_ERROR("PSN_PATH_K requires a positive value fitting the control word");
                 std::cerr << "PSN_PATH_K\t\t" << psn_path_k << "\n";
             } else if (key.compare("PSN_PATH_BETA") == 0) {
-                conf >> psn_path_beta;
+                if (!(conf >> psn_path_beta) || !std::isfinite(psn_path_beta) || psn_path_beta < 0 ||
+                    psn_path_beta == PsnPathScore::UnsetThreshold())
+                    NS_FATAL_ERROR("PSN_PATH_BETA requires an explicit finite nonnegative value");
                 std::cerr << "PSN_PATH_BETA\t\t" << psn_path_beta << "\n";
-            } else if (key.compare("PSN_PATH_GAP_TIMEOUT_NS") == 0) {
-                conf >> psn_path_gap_timeout_ns;
-                std::cerr << "PSN_PATH_GAP_TIMEOUT_NS\t" << psn_path_gap_timeout_ns << "\n";
+            } else if (key == "PSN_PATH_BASE_PORT") {
+                if (!(conf >> psn_path_base_port) || psn_path_base_port > UINT16_MAX)
+                    NS_FATAL_ERROR("PSN_PATH_BASE_PORT must fit a UDP source port");
+            } else if (key == "PSN_PATH_O") {
+                if (!(conf >> psn_path_offset) || psn_path_offset > UINT16_MAX)
+                    NS_FATAL_ERROR("PSN_PATH_O must fit the path control word");
+            } else if (key == "PSN_PATH_EVAL_INTERVAL_US") {
+                if (!(conf >> psn_path_eval_interval_us) || !std::isfinite(psn_path_eval_interval_us) ||
+                    psn_path_eval_interval_us <= 0)
+                    NS_FATAL_ERROR("PSN_PATH_EVAL_INTERVAL_US requires an explicit positive interval");
+            } else if (key == "PSN_PATH_T_EXPLORE") {
+                if (!(conf >> psn_path_t_explore)) NS_FATAL_ERROR("PSN_PATH_T_EXPLORE requires a numeric value");
+            } else if (key == "PSN_PATH_T_REMOVE") {
+                if (!(conf >> psn_path_t_remove)) NS_FATAL_ERROR("PSN_PATH_T_REMOVE requires a numeric value");
+            } else if (key == "PSN_PATH_GAP_TIMEOUT_NS") {
+                NS_FATAL_ERROR("PSN_PATH_GAP_TIMEOUT_NS is removed: PSN-PATH uses same-path loss evidence and sender RTO");
+            } else if (key.compare("PSN_PATH_NORMALIZE_SCORE") == 0) {
+                int value;
+                if (!(conf >> value) || (value != 0 && value != 1)) {
+                    NS_FATAL_ERROR("PSN_PATH_NORMALIZE_SCORE must be 0 or 1");
+                }
+                psn_path_normalize_score = (value == 1);
+                std::cerr << key << "\t" << psn_path_normalize_score << "\n";
+            } else if (key.compare("PSN_PATH_NORMALIZED_T_EXPLORE") == 0) {
+                if (!(conf >> psn_path_normalized_t_explore)) {
+                    NS_FATAL_ERROR("PSN_PATH_NORMALIZED_T_EXPLORE requires a numeric value");
+                }
+                std::cerr << key << "\t" << psn_path_normalized_t_explore << "\n";
+            } else if (key.compare("PSN_PATH_NORMALIZED_T_REMOVE") == 0) {
+                if (!(conf >> psn_path_normalized_t_remove)) {
+                    NS_FATAL_ERROR("PSN_PATH_NORMALIZED_T_REMOVE requires a numeric value");
+                }
+                std::cerr << key << "\t" << psn_path_normalized_t_remove << "\n";
             } else if (key.compare("ENABLE_PSN_PATH") == 0) {
                 bool v;
                 conf >> v;
@@ -1665,10 +1709,10 @@ int main(int argc, char *argv[]) {
                 enable_tx_nack_goback = v;
                 std::cerr << "ENABLE_TX_NACK_GOBACK\t"
                           << (enable_tx_nack_goback ? "Yes" : "No") << "\n";
-            } else if (key.compare("TX_NACK_RETRANS_INTERVAL_NS") == 0) {
-                conf >> tx_nack_retrans_interval_ns;
-                std::cerr << "TX_NACK_RETRANS_INTERVAL_NS\t"
-                          << tx_nack_retrans_interval_ns << "\n";
+            } else if (key == "TX_NACK_RETRANS_INTERVAL_NS" ||
+                       key == "FALCON_RX_SEND_DELAY_NS" || key == "ORNIC_RX_SEND_DELAY_NS") {
+                NS_FATAL_ERROR(key << " has been removed; delete this fixed-delay setting "
+                                   "from the configuration, including values of zero");
             } else if (key.compare("ENABLE_BITMAP_RETRANS") == 0) {
                 bool v;
                 conf >> v;
@@ -1688,26 +1732,29 @@ int main(int argc, char *argv[]) {
                 conf >> v;
                 enable_falcon = v;
                 std::cerr << "ENABLE_FALCON\t\t" << (enable_falcon ? "Yes" : "No") << "\n";
-            } else if (key.compare("FALCON_RX_SEND_DELAY_NS") == 0) {
-                conf >> falcon_rx_send_delay_ns;
-                std::cerr << "FALCON_RX_SEND_DELAY_NS\t" << falcon_rx_send_delay_ns << "\n";
             } else if (key.compare("FALCON_RETRANS_RTT_K") == 0) {
-                conf >> falcon_retrans_rtt_k;
-                falcon_retrans_rtt_k = std::max(0.0, falcon_retrans_rtt_k);
+                if (!(conf >> falcon_retrans_rtt_k)) {
+                    NS_FATAL_ERROR("FALCON_RETRANS_RTT_K requires a numeric value");
+                }
                 std::cerr << "FALCON_RETRANS_RTT_K\t" << falcon_retrans_rtt_k << "\n";
+            } else if (key == "FALCON_OOO_DISTANCE_THRESHOLD") {
+                if (!(conf >> falcon_ooo_distance_threshold) ||
+                    falcon_ooo_distance_threshold >= FalconRetransModule::kBitmapBits) {
+                    NS_FATAL_ERROR("FALCON_OOO_DISTANCE_THRESHOLD must fit the Falcon bitmap");
+                }
+                std::cerr << key << "\t" << falcon_ooo_distance_threshold << "\n";
             } else if (key.compare("ENABLE_ORNIC") == 0) {
                 bool v;
                 conf >> v;
                 enable_ornic = v;
                 std::cerr << "ENABLE_ORNIC\t\t" << (enable_ornic ? "Yes" : "No") << "\n";
-            } else if (key.compare("ORNIC_BW_GBPS") == 0) {
-                double v;
-                conf >> v;
-                ornic_bw_gbps = v;
-                std::cerr << "ORNIC_BW_GBPS\t\t" << ornic_bw_gbps << "\n";
-            } else if (key.compare("ORNIC_RX_SEND_DELAY_NS") == 0) {
-                conf >> ornic_rx_send_delay_ns;
-                std::cerr << "ORNIC_RX_SEND_DELAY_NS\t" << ornic_rx_send_delay_ns << "\n";
+            } else if (key == "ORNIC_OTD") {
+                if (!(conf >> ornic_otd) || !std::isfinite(ornic_otd) || ornic_otd < 0) {
+                    NS_FATAL_ERROR("ORNIC_OTD requires a finite, nonnegative PSN distance");
+                }
+                std::cerr << key << "\t" << ornic_otd << "\n";
+            } else if (key == "ORNIC_DELAY_WINDOW" || key == "ORNIC_BW_GBPS") {
+                NS_FATAL_ERROR("Unsupported ORNIC estimator setting; configure ORNIC_OTD");
             } else if (key.compare("RANDOM_SEED") == 0) {
                 int v;
                 conf >> v;
@@ -1738,6 +1785,40 @@ int main(int argc, char *argv[]) {
     }
 
     /******************* READING CONFIG FILE IS DONE ***********************/
+    if (enable_falcon && (!std::isfinite(falcon_retrans_rtt_k) || falcon_retrans_rtt_k < 1.0)) {
+        NS_FATAL_ERROR("Falcon requires FALCON_RETRANS_RTT_K >= 1; RTT checks cannot be disabled");
+    }
+    if (enable_ornic && (!std::isfinite(ornic_otd) || ornic_otd < 0)) {
+        NS_FATAL_ERROR("ORNIC requires explicit ORNIC_OTD in PSN units");
+    }
+    if ((enable_psn_path || enable_path_select || enable_path_aware_retrans) && psn_path_k == 0)
+        NS_FATAL_ERROR("PSN-PATH requires explicit PSN_PATH_K");
+    if (enable_path_switch && (enable_psn_path || enable_path_select)) {
+        if (psn_path_beta == PsnPathScore::UnsetThreshold())
+            NS_FATAL_ERROR("PSN-PATH switching requires explicit PSN_PATH_BETA");
+        if (psn_path_eval_interval_us <= 0)
+            NS_FATAL_ERROR("PSN-PATH switching requires explicit PSN_PATH_EVAL_INTERVAL_US");
+        if (!psn_path_normalize_score &&
+            (psn_path_t_explore == PsnPathScore::UnsetThreshold() ||
+             psn_path_t_remove == PsnPathScore::UnsetThreshold() ||
+             !std::isfinite(psn_path_t_explore) || !std::isfinite(psn_path_t_remove) ||
+             psn_path_t_remove > psn_path_t_explore))
+            NS_FATAL_ERROR("Raw path scores require explicit ordered PSN_PATH_T_EXPLORE and PSN_PATH_T_REMOVE");
+        // Candidate migration is deliberately pending the author's protocol decision.
+        // Refuse the unsupported region up front, not halfway through an experiment.
+        const double explore = psn_path_normalize_score ? psn_path_normalized_t_explore : psn_path_t_explore;
+        const double remove = psn_path_normalize_score ? psn_path_normalized_t_remove : psn_path_t_remove;
+        if (explore != PsnPathScore::UnsetThreshold() && remove != PsnPathScore::UnsetThreshold() && explore > remove)
+            NS_FATAL_ERROR("Gradual DT-Switch is pending protocol clarification; only fixed paths and removal-only switching are supported");
+    }
+    if (psn_path_normalize_score &&
+        (psn_path_beta == PsnPathScore::UnsetThreshold() ||
+         !PsnPathScore::ValidThresholds(psn_path_beta, psn_path_normalized_t_explore,
+                                       psn_path_normalized_t_remove))) {
+        NS_FATAL_ERROR("PSN_PATH_NORMALIZE_SCORE=1 requires explicit "
+                       "PSN_PATH_NORMALIZED_T_EXPLORE and PSN_PATH_NORMALIZED_T_REMOVE: "
+                       "finite beta >= 0 and -beta <= remove <= explore <= 1");
+    }
     ParseBurstLossSchedule();
     if (burst_stat_end_ns != 0 && burst_stat_end_ns <= burst_stat_start_ns) {
         NS_FATAL_ERROR("BURST_STAT_END_NS must be greater than BURST_STAT_START_NS, or 0 to disable the end bound");
@@ -1830,9 +1911,9 @@ int main(int argc, char *argv[]) {
     //
     // Assign IP to each server
     //
+    serverAddress.resize(node_num);
     for (uint32_t i = 0; i < node_num; i++) {
         if (n.Get(i)->GetNodeType() == 0) {  // is server
-            serverAddress.resize(i + 1);
             serverAddress[i] = Settings::node_id_to_ip(i);
         }
     }
@@ -1949,9 +2030,9 @@ int main(int argc, char *argv[]) {
                 printf("size of serverAddress: %lu", serverAddress.size());
                 NS_FATAL_ERROR("An end-host belongs to no link");
             }
+            Settings::hostId2IpMap[i] = serverAddress[i].Get();
+            Settings::hostIp2IdMap[serverAddress[i].Get()] = i;
         }
-        Settings::hostId2IpMap[i] = serverAddress[i].Get();
-        Settings::hostIp2IdMap[serverAddress[i].Get()] = i;
     }
     ProgressLog("[PROGRESS] Host IP mapping initialized.\n");
 
@@ -2037,30 +2118,6 @@ int main(int argc, char *argv[]) {
      *new rate can be divided by 2 at maximum)
      */
 
-    // manually type BDP
-    std::map<std::string, uint32_t> topo2bdpMap;
-    topo2bdpMap[std::string("leaf_spine_128_100G_OS2")] = 104000;  // RTT=8320
-    topo2bdpMap[std::string("fat_k8_100G_OS2")] = 156000;      // RTT=12480 --> all 100G links
-
-    // topology_file
-    bool found_topo2bdpMap = false;
-    uint32_t irn_bdp_lookup = 0;
-    for (auto pair : topo2bdpMap) {
-        if (topology_file.find(pair.first) !=
-            std::string::npos) {  // if topology file string includes the word
-            irn_bdp_lookup = pair.second;
-            found_topo2bdpMap = true;
-            break;
-        }
-    }
-    if (found_topo2bdpMap == false) {
-        // Allow custom topologies without enforcing a hardcoded IRN BDP mapping.
-        irn_bdp_lookup = 0;
-        std::cout << __FILE__ << "(" << __LINE__ << ")"
-                  << " WARN - topo2bdpMap has no matched item with " << topology_file
-                  << ", disable IRN BDP strict check and continue with IrnBdp=0" << std::endl;
-    }
-
     // rdmaHw config
     for (uint32_t i = 0; i < node_num; i++) {
         if (n.Get(i)->GetNodeType() == 0) {  // is server
@@ -2103,28 +2160,39 @@ int main(int argc, char *argv[]) {
                                  BooleanValue(enable_path_aware_retrans));
             rdmaHw->SetAttribute("EnableRxOooNack", BooleanValue(enable_rx_ooo_nack));
             rdmaHw->SetAttribute("EnableTxNackGoBack", BooleanValue(enable_tx_nack_goback));
-            rdmaHw->SetAttribute("TxNackRetransInterval",
-                                 TimeValue(NanoSeconds(tx_nack_retrans_interval_ns)));
             rdmaHw->SetAttribute("EnableBitmapRetrans", BooleanValue(enable_bitmap_retrans));
             rdmaHw->SetAttribute("BitmapRetransSize", UintegerValue(bitmap_retrans_size));
             rdmaHw->SetAttribute("BitmapRetransTimeout",
                                  TimeValue(NanoSeconds(bitmap_retrans_timeout_ns)));
             rdmaHw->SetAttribute("EnableFalcon", BooleanValue(enable_falcon));
-            rdmaHw->SetAttribute("FalconRxSendDelay",
-                                 TimeValue(NanoSeconds(falcon_rx_send_delay_ns)));
-            rdmaHw->SetAttribute("FalconRetransRttK", DoubleValue(falcon_retrans_rtt_k));
+            if (enable_falcon) {
+                rdmaHw->SetAttribute("FalconRetransRttK", DoubleValue(falcon_retrans_rtt_k));
+                rdmaHw->SetAttribute("FalconOooDistanceThreshold",
+                                     UintegerValue(falcon_ooo_distance_threshold));
+            }
             rdmaHw->SetAttribute("EnableOrnic", BooleanValue(enable_ornic));
-            rdmaHw->SetAttribute("OrnicBandwidthGbps", DoubleValue(ornic_bw_gbps));
-            rdmaHw->SetAttribute("OrnicRxSendDelay",
-                                 TimeValue(NanoSeconds(ornic_rx_send_delay_ns)));
+            if (enable_ornic) {
+                rdmaHw->SetAttribute("OrnicOtd", DoubleValue(ornic_otd));
+            }
             rdmaHw->SetAttribute("PsnPathK", UintegerValue(psn_path_k));
+            rdmaHw->SetAttribute("PsnPathO", UintegerValue(psn_path_offset));
+            rdmaHw->SetAttribute("PsnPathBasePort", UintegerValue(psn_path_base_port));
+            rdmaHw->SetAttribute("PsnPathEvalIntervalUs", DoubleValue(psn_path_eval_interval_us));
+            rdmaHw->SetAttribute("PsnPathTExplore", DoubleValue(psn_path_t_explore));
+            rdmaHw->SetAttribute("PsnPathTRemove", DoubleValue(psn_path_t_remove));
             rdmaHw->SetAttribute("PsnPathBeta", DoubleValue(psn_path_beta));
-            rdmaHw->SetAttribute("PsnPathGapTimeout",
-                                 TimeValue(NanoSeconds(psn_path_gap_timeout_ns)));
-            // topo2bdpMap (e.g., longest BDP 25000: 8us * 25Gbps)
+            rdmaHw->SetAttribute("EnablePsnPathNormalizedScore",
+                                 BooleanValue(psn_path_normalize_score));
+            if (psn_path_normalize_score) {
+                rdmaHw->SetAttribute("PsnPathNormalizedTExplore",
+                                     DoubleValue(psn_path_normalized_t_explore));
+                rdmaHw->SetAttribute("PsnPathNormalizedTRemove",
+                                     DoubleValue(psn_path_normalized_t_remove));
+            }
+            // Set the topology-derived BDP after routing/RTT calculation below.
             rdmaHw->SetAttribute("IrnRtoHigh", TimeValue(MicroSeconds(320)));  // 1930
             rdmaHw->SetAttribute("IrnRtoLow", TimeValue(MicroSeconds(100)));   // 454
-            rdmaHw->SetAttribute("IrnBdp", UintegerValue(irn_bdp_lookup));
+            rdmaHw->SetAttribute("IrnBdp", UintegerValue(irn_bdp));
             // Monitoring CNP Marking frequency of DCQCN
             if (cc_mode == 1) {
                 Simulator::Schedule(NanoSeconds(cnp_mon_start), &cnp_freq_monitoring, cnp_output,
@@ -2199,9 +2267,19 @@ int main(int argc, char *argv[]) {
         }
     }
     fprintf(stderr, "maxRtt: %lu, maxBdp: %lu\n", maxRtt, maxBdp);
-    // if (enable_irn) {
-    //     assert(maxBdp == irn_bdp_lookup);
-    // }
+    if (enable_irn) {
+        uint64_t effectiveBdp = irn_bdp == 0 ? maxBdp : irn_bdp;
+        if (effectiveBdp == 0 || effectiveBdp > std::numeric_limits<uint32_t>::max()) {
+            NS_FATAL_ERROR("IRN requires a positive BDP fitting uint32_t; check the topology "
+                           "or supply IRN_BDP in bytes");
+        }
+        std::cerr << "IRN effective BDP (bytes): " << effectiveBdp << "\n";
+        for (uint32_t i = 0; i < node_num; ++i) {
+            if (n.Get(i)->GetNodeType() != 0) continue;
+            n.Get(i)->GetObject<RdmaDriver>()->m_rdma->SetAttribute(
+                "IrnBdp", UintegerValue(static_cast<uint32_t>(effectiveBdp)));
+        }
+    }
 
     std::cout << "Configuring switches" << std::endl;
     /* config ToR Switch */

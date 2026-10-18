@@ -84,19 +84,13 @@ std::vector<uint32_t> FalconRetransModule::OnAck(const RdmaFlowKey &key, uint32_
                                                  uint16_t bitmapBits, uint64_t bitmap,
                                                  uint32_t packetSize, Time now,
                                                  Time retransAgeThreshold,
-                                                 std::vector<std::pair<uint32_t, Time> > *deferredRetrans) {
+                                                 std::vector<std::pair<uint32_t, Time> > *deferredRetrans,
+                                                 uint32_t oooDistanceThreshold) {
     std::vector<uint32_t> retransSeqs;
     TxState &state = m_txStates[key];
     const uint32_t step = std::max<uint32_t>(1, packetSize);
 
-    for (std::map<uint32_t, TxSegmentState>::iterator it = state.outstanding.begin();
-         it != state.outstanding.end();) {
-        if (it->first >= cumAckSeq) break;
-        state.selectiveAckedBytes =
-            state.selectiveAckedBytes >= it->second.size ? state.selectiveAckedBytes - it->second.size : 0;
-        state.retransPending.erase(it->first);
-        it = state.outstanding.erase(it);
-    }
+    ClearAcked(key, cumAckSeq);
 
     const uint16_t validBits = std::min<uint16_t>(bitmapBits, kBitmapBits);
     for (uint16_t bit = 0; bit < validBits; ++bit) {
@@ -109,33 +103,26 @@ std::vector<uint32_t> FalconRetransModule::OnAck(const RdmaFlowKey &key, uint32_
             continue;
         }
         state.selectiveAckedBytes += it->second.size;
+        state.selectivelyAcked[seq] = it->second.size;
+        state.highestSackedSeq = std::max(state.highestSackedSeq, seq);
+        state.hasSack = true;
         state.retransPending.erase(seq);
         state.outstanding.erase(it);
     }
 
-    uint16_t scanBits = validBits;
-    while (scanBits > 0 && ((bitmap >> (scanBits - 1)) & uint64_t(1)) == 0) {
-        --scanBits;
-    }
-    const bool urgentGap = scanBits >= std::max<uint16_t>(1, validBits / 2);
-
-    for (uint16_t bit = 0; bit < scanBits; ++bit) {
-        if (((bitmap >> bit) & uint64_t(1)) != 0) {
+    // OCP Falcon 1.0, section 9.1.4: both distance and recency checks apply
+    // to every early retransmission. Unknown RTT must not disable the gate.
+    if (!state.hasSack || retransAgeThreshold <= Time(0)) return retransSeqs;
+    for (const auto &entry : state.outstanding) {
+        const uint32_t seq = entry.first;
+        if (seq >= state.highestSackedSeq ||
+            (state.highestSackedSeq - seq) / step <= oooDistanceThreshold) continue;
+        if (state.retransPending.count(seq) != 0) continue;
+        Time delay;
+        if (!GetRetransmissionDelay(key, seq, now, retransAgeThreshold, delay)) continue;
+        if (delay > Time(0)) {
+            if (deferredRetrans != 0) deferredRetrans->push_back(std::make_pair(seq, delay));
             continue;
-        }
-        const uint32_t seq = cumAckSeq + static_cast<uint32_t>(bit) * step;
-        std::map<uint32_t, TxSegmentState>::iterator it = state.outstanding.find(seq);
-        if (it == state.outstanding.end()) {
-            continue;
-        }
-        if (!urgentGap && !retransAgeThreshold.IsZero()) {
-            Time age = now - it->second.lastSent;
-            if (age < retransAgeThreshold) {
-                if (deferredRetrans != 0) {
-                    deferredRetrans->push_back(std::make_pair(seq, retransAgeThreshold - age));
-                }
-                continue;
-            }
         }
         if (state.retransPending.insert(seq).second) {
             retransSeqs.push_back(seq);
@@ -145,7 +132,25 @@ std::vector<uint32_t> FalconRetransModule::OnAck(const RdmaFlowKey &key, uint32_
 }
 
 bool FalconRetransModule::MarkRetransPending(const RdmaFlowKey &key, uint32_t seq) {
-    return m_txStates[key].retransPending.insert(seq).second;
+    auto it = m_txStates.find(key);
+    if (it == m_txStates.end() || it->second.outstanding.count(seq) == 0) return false;
+    return it->second.retransPending.insert(seq).second;
+}
+
+bool FalconRetransModule::IsOutstanding(const RdmaFlowKey &key, uint32_t seq) const {
+    auto it = m_txStates.find(key);
+    return it != m_txStates.end() && it->second.outstanding.count(seq) != 0;
+}
+
+bool FalconRetransModule::GetRetransmissionDelay(const RdmaFlowKey &key, uint32_t seq,
+                                                 Time now, Time threshold, Time &delay) const {
+    auto flow = m_txStates.find(key);
+    if (flow == m_txStates.end() || threshold <= Time(0)) return false;
+    auto packet = flow->second.outstanding.find(seq);
+    if (packet == flow->second.outstanding.end()) return false;
+    const Time age = now - packet->second.lastSent;
+    delay = age > threshold ? Time(0) : threshold - age + TimeStep(1);
+    return true;
 }
 
 void FalconRetransModule::ClearRetransPending(const RdmaFlowKey &key, uint32_t seq) {
@@ -157,10 +162,13 @@ void FalconRetransModule::ClearAcked(const RdmaFlowKey &key, uint32_t cumAckSeq)
     for (std::map<uint32_t, TxSegmentState>::iterator it = state.outstanding.begin();
          it != state.outstanding.end();) {
         if (it->first >= cumAckSeq) break;
-        state.selectiveAckedBytes =
-            state.selectiveAckedBytes >= it->second.size ? state.selectiveAckedBytes - it->second.size : 0;
         state.retransPending.erase(it->first);
         it = state.outstanding.erase(it);
+    }
+    for (auto it = state.selectivelyAcked.begin(); it != state.selectivelyAcked.end();) {
+        if (static_cast<uint64_t>(it->first) + it->second > cumAckSeq) break;
+        state.selectiveAckedBytes -= it->second;
+        it = state.selectivelyAcked.erase(it);
     }
 }
 

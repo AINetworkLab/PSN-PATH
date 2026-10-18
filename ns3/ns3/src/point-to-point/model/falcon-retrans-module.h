@@ -45,8 +45,12 @@ class FalconRetransModule {
     std::vector<uint32_t> OnAck(const RdmaFlowKey &key, uint32_t cumAckSeq,
                                 uint16_t bitmapBits, uint64_t bitmap, uint32_t packetSize,
                                 Time now, Time retransAgeThreshold,
-                                std::vector<std::pair<uint32_t, Time> > *deferredRetrans = 0);
+                                std::vector<std::pair<uint32_t, Time> > *deferredRetrans = 0,
+                                uint32_t oooDistanceThreshold = 0);
 
+    bool IsOutstanding(const RdmaFlowKey &key, uint32_t seq) const;
+    bool GetRetransmissionDelay(const RdmaFlowKey &key, uint32_t seq, Time now,
+                                Time threshold, Time &delay) const;
     bool MarkRetransPending(const RdmaFlowKey &key, uint32_t seq);
     void ClearRetransPending(const RdmaFlowKey &key, uint32_t seq);
     void ClearAcked(const RdmaFlowKey &key, uint32_t cumAckSeq);
@@ -62,8 +66,11 @@ class FalconRetransModule {
 
     struct TxState {
         std::map<uint32_t, TxSegmentState> outstanding;
+        std::map<uint32_t, uint32_t> selectivelyAcked;
         std::unordered_set<uint32_t> retransPending;
         uint64_t selectiveAckedBytes{0};
+        uint32_t highestSackedSeq{0};
+        bool hasSack{false};
     };
 
     struct RxState {

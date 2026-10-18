@@ -20,12 +20,6 @@
 
 namespace ns3 {
 
-enum class RxControlDelayKind {
-    None,
-    Falcon,
-    Ornic,
-};
-
 struct RdmaInterfaceMgr {
     Ptr<QbbNetDevice> dev;
     Ptr<RdmaQueuePairGroup> qpGrp;
@@ -108,9 +102,6 @@ class RdmaHw : public Object {
     void CheckandSendQCN(Ptr<RdmaRxQueuePair> q);
     int ReceiverCheckSeq(uint32_t &seq, Ptr<RdmaRxQueuePair> q, uint32_t size, bool &cnp);
     int ReceiverCheckSeqPsnPath(uint32_t &seq, Ptr<RdmaRxQueuePair> q, uint32_t size, bool &cnp);
-    void SchedulePsnPathGapTimer(Ptr<RdmaRxQueuePair> q);
-    void HandlePsnPathGapTimeout(Ptr<RdmaRxQueuePair> q, uint32_t missingPsn);
-    void SendPsnPathGapTimeoutNack(Ptr<RdmaRxQueuePair> q, uint32_t missingPsn);
     void AddHeader(Ptr<Packet> p, uint16_t protocolNumber);
     static uint16_t EtherToPpp(uint16_t protocol);
 
@@ -129,6 +120,7 @@ class RdmaHw : public Object {
     void ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate);
 
     void HandleTimeout(Ptr<RdmaQueuePair> qp, Time rto);
+    uint32_t GetPsnPathControlBytes() const;
     void EvaluatePathState(Ptr<RdmaQueuePair> qp);
     void SchedulePathStateEval(Ptr<RdmaQueuePair> qp);
 
@@ -222,33 +214,31 @@ class RdmaHw : public Object {
     bool m_enablePathAwareRetrans;
     bool m_enableRxOooNack;
     bool m_enableTxNackGoBack;
-    Time m_txNackRetransInterval;
     bool m_enableBitmapRetrans;
     bool m_enableFalcon;
     bool m_enableOrnic;
     double m_falconRetransRttK;
+    uint32_t m_falconOooDistanceThreshold;
     uint32_t m_bitmapRetransSize;
     Time m_bitmapRetransTimeout;
-    Time m_falconRxSendDelay;
-    Time m_ornicRxSendDelay;
-    double m_ornicBandwidthGbps;
+    double m_ornicOtd;
     uint32_t m_psnPathK;
     uint32_t m_psnPathO;
     uint32_t m_psnPathBasePort;
     uint32_t m_psnPathPacketSize;
     double m_psnPathBeta;
-    uint32_t m_psnPathTExplore;
-    uint32_t m_psnPathTRemove;
+    bool m_enablePsnPathNormalizedScore;
+    double m_psnPathNormalizedTExplore;
+    double m_psnPathNormalizedTRemove;
+    double m_psnPathTExplore;
+    double m_psnPathTRemove;
     double m_psnPathEvalIntervalUs;
-    uint32_t m_psnPathProbeFrequency;
-    Time m_psnPathGapTimeout;
     BitmapRetransModule m_bitmapRetrans;
     FalconRetransModule m_falcon;
     OrnicRetransModule m_ornicRetrans;
-    void SendRxControlPacket(Ptr<QbbNetDevice> dev, Ptr<Packet> p,
-                             RxControlDelayKind delayKind);
-    void SendRxControlPacketNow(Ptr<QbbNetDevice> dev, Ptr<Packet> p);
+    void SendRxControlPacket(Ptr<QbbNetDevice> dev, Ptr<Packet> p);
     void EnqueueFalconBitmapRetrans(Ptr<RdmaQueuePair> qp, uint32_t seq);
+    Time GetFalconRetransAgeThreshold(Ptr<RdmaQueuePair> qp) const;
     void ScheduleDeferredFalconBitmapRetrans(Ptr<RdmaQueuePair> qp, uint32_t seq, Time delay);
     void EnqueueDeferredFalconBitmapRetrans(Ptr<RdmaQueuePair> qp, uint32_t seq);
     void UpdateBitmapExpectedTimeout(Ptr<RdmaRxQueuePair> q,

@@ -1,0 +1,16 @@
+# Private ns-3 experiment inputs and runtime outputs.
+/mix/
+/windows/ns-3-dev/x64/Release/mix/
+/config.txt
+/topology.txt
+/flow.txt
+/fct.txt
+/pfc.txt
+/cnp.txt
+/qlen.txt
+/voq.txt
+/voq_detail.txt
+/uplink.txt
+/conn.txt
+/est_error.txt
+/burst_loss.txt

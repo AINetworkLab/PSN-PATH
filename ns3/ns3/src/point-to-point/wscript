@@ -72,6 +72,8 @@ def build(bld):
         'model/conweave-routing.h',
         'model/conweave-voq.h',
         'model/psn-path.h',
+        'model/psn-path-score.h',
+        'model/retransmission-timestamp-tag.h',
 		'helper/selective-packet-queue.h',
         ]
 

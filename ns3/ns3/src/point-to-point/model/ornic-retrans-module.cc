@@ -1,22 +1,20 @@
 #include "ornic-retrans-module.h"
 
 #include <algorithm>
+#include <cmath>
+#include "ns3/abort.h"
 
 namespace ns3 {
-
-void OrnicRetransModule::SetWindowSize(uint32_t windowSize) {
-    m_windowSize = std::max<uint32_t>(1, windowSize);
-}
-
-void OrnicRetransModule::SetBandwidthGbps(double bandwidthGbps) {
-    m_bandwidthGbps = std::max(0.0, bandwidthGbps);
-}
 
 void OrnicRetransModule::RegisterTxFlow(const RdmaFlowKey &key) { m_txStates[key]; }
 
 void OrnicRetransModule::UnregisterTxFlow(const RdmaFlowKey &key) { m_txStates.erase(key); }
 
-void OrnicRetransModule::RegisterRxFlow(const RdmaFlowKey &key) { m_rxStates[key]; }
+void OrnicRetransModule::RegisterRxFlow(const RdmaFlowKey &key, double otd) {
+    NS_ABORT_MSG_IF(!std::isfinite(otd) || otd < 0,
+                    "ORNIC requires an explicit finite, nonnegative OTD in PSN units");
+    m_rxStates[key].otd = otd;
+}
 
 void OrnicRetransModule::UnregisterRxFlow(const RdmaFlowKey &key) { m_rxStates.erase(key); }
 
@@ -61,29 +59,15 @@ void OrnicRetransModule::ClearRetransMarker(const RdmaFlowKey &key, uint32_t seq
 }
 
 OrnicRxFeedback OrnicRetransModule::OnData(const RdmaFlowKey &key, uint32_t seq, uint32_t size,
-                                           uint32_t packetSize, uint64_t oneWayDelayNs) {
-    RxState &state = m_rxStates[key];
-    if (oneWayDelayNs != 0) {
-        state.delaySamplesNs.push_back(oneWayDelayNs);
-        while (state.delaySamplesNs.size() > m_windowSize) {
-            state.delaySamplesNs.pop_front();
-        }
-    }
+                                           uint32_t packetSize) {
+    auto flow = m_rxStates.find(key);
+    NS_ABORT_MSG_IF(flow == m_rxStates.end(), "ORNIC receive flow has no configured OTD");
+    RxState &state = flow->second;
     OrnicRxFeedback feedback;
     uint32_t step = packetSize == 0 ? std::max<uint32_t>(1, size) : packetSize;
     feedback.ackSeq = state.expectedSeq;
-    bool hasDelayWindow = state.delaySamplesNs.size() >= 2;
-    if (hasDelayWindow) {
-        std::deque<uint64_t>::const_iterator minIt =
-            std::min_element(state.delaySamplesNs.begin(), state.delaySamplesNs.end());
-        std::deque<uint64_t>::const_iterator maxIt =
-            std::max_element(state.delaySamplesNs.begin(), state.delaySamplesNs.end());
-        feedback.rttMinNs = *minIt * 2;
-        feedback.rttMaxNs = *maxIt * 2;
-        feedback.mddNs = *maxIt - *minIt;
-    }
-    feedback.otd = step == 0 ? 0.0 : (static_cast<double>(feedback.mddNs) * m_bandwidthGbps) /
-                                      static_cast<double>(step * 8);
+    // ORNIC Section 3.3 configures OTD per QP; it does not prescribe a delay sampler.
+    feedback.otd = state.otd;
 
     if (seq < state.expectedSeq) {
         feedback.sendControl = true;
@@ -113,7 +97,7 @@ OrnicRxFeedback OrnicRetransModule::OnData(const RdmaFlowKey &key, uint32_t seq,
     feedback.gap = psn > expectedPsn ? psn - expectedPsn : 0;
     state.outOfOrder[seq] = size;
     feedback.sendControl = true;
-    feedback.isNack = hasDelayWindow && feedback.gap > feedback.otd;
+    feedback.isNack = feedback.gap > feedback.otd;
     feedback.ackSeq = state.expectedSeq;
     feedback.nackSeq = state.expectedSeq;
     feedback.nackSize = step;

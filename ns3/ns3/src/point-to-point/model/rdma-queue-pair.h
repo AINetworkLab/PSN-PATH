@@ -11,8 +11,10 @@
 #include <ns3/selective-packet-queue.h>
 
 #include <climits> /* for CHAR_BIT */
+#include <algorithm>
 #include <array>
 #include <deque>
+#include <map>
 #include <unordered_set>
 #include <vector>
 
@@ -44,12 +46,33 @@ struct PsnPathStats {
     bool probing{false};
 };
 
+// A logical lane survives physical path replacement (PSN modulo K is invariant).
+struct PsnLaneState {
+    uint32_t offset{0};
+    uint32_t fpsn{0};
+    uint32_t epoch{0};
+    bool boundaryPending{false};
+};
+
+struct PsnTransmission {
+    uint32_t pathId{0};
+    uint32_t epoch{0};
+    uint32_t fpsn{0};
+    uint32_t offset{0};
+    uint32_t size{0};
+    bool retransmitted{false};
+    bool lossCounted{false};
+};
+
 struct PsnMappingSnapshot {
     uint32_t epoch{0};
     uint32_t k{0};
     uint32_t o{0};
     uint32_t fpsn{0};
     uint32_t activePathMask{0};
+    uint32_t lane{0};
+    uint32_t pathId{0};
+    bool retransmission{false};
 };
 
 struct PsnRetransRequest {
@@ -63,16 +86,23 @@ struct PsnPathState {
     bool pathSelectionEnabled{false};
     bool pathSwitchEnabled{false};
     bool pathAwareRetransEnabled{false};
-    uint32_t k{4};
+    uint32_t k{0};
     uint32_t o{0};
-    uint32_t basePort{10000};
-    uint32_t activePathCount{4};
-    uint32_t packetSize{8192};
+    uint32_t basePort{0};
+    uint32_t activePathCount{0};
+    uint32_t packetSize{0};
     uint32_t fpsn{0};
     uint32_t mappingEpoch{0};
-    uint32_t probeEveryN{64};
-    uint32_t probeCountdown{0};
     std::vector<PsnPathStats> pathStats;
+    std::vector<PsnLaneState> lanes;
+    // Only unacknowledged original transmissions; never evict in-flight context.
+    std::map<uint32_t, PsnTransmission> transmissions;
+
+    void InitializeLanes();
+    uint32_t SelectPath(uint32_t psn) const;
+    void RecordTransmission(uint32_t psn, uint32_t size, bool retransmitted);
+    bool ReplacePath(uint32_t lane);
+    void RecordFeedback(uint32_t ackSeq, bool loss, uint32_t nackSeq, uint32_t nackSize);
     std::deque<PsnRetransRequest> pendingRetrans;
     EventId evalEvent;
 };
@@ -112,6 +142,8 @@ class IrnSackManager {
     bool IsEmpty();
     bool blockExists(uint32_t seq, uint32_t size);  // query if block exists inside SACK table
     bool peekFrontBlock(uint32_t *pseq, uint32_t *psize);
+    bool blockContaining(uint32_t seq, uint32_t *end) const;
+    uint32_t highestSackEnd() const;
     size_t getSackBufferOverhead();  // get buffer overhead
 
     friend std::ostream &operator<<(std::ostream &os, const IrnSackManager &im);
@@ -196,6 +228,7 @@ class RdmaQueuePair : public Object {
 
     struct {
         bool m_enabled;
+        bool m_selectiveRetrans;
         uint32_t m_bdp;          // m_irn_maxAck_
         uint32_t m_highest_ack;  // m_irn_maxAck_
         uint32_t m_max_seq;      // m_irn_maxSeq_
@@ -204,6 +237,7 @@ class RdmaQueuePair : public Object {
         IrnSackManager m_sack;
         bool m_recovery;
         uint32_t m_recovery_seq;
+        bool m_retransmitFirst;
     } irn;
 
     struct {
@@ -236,6 +270,8 @@ class RdmaQueuePair : public Object {
     void SetTimeout(Time v);
 
     uint64_t GetBytesLeft();
+    void PrepareIrnTransmission();
+    void StartIrnRecovery();
     uint32_t GetHash(void);
     void Acknowledge(uint64_t ack);
     uint64_t GetOnTheFly();
@@ -248,7 +284,8 @@ class RdmaQueuePair : public Object {
 
     inline uint32_t GetIrnBytesInFlight() const {
         // IRN do not consider SACKed segments for simplicity
-        return irn.m_max_seq - irn.m_highest_ack;
+        return irn.m_max_seq > irn.m_highest_ack
+                   ? irn.m_max_seq - irn.m_highest_ack : 0;
     }
 
     Time GetRto(uint32_t mtu) {
@@ -265,13 +302,10 @@ class RdmaQueuePair : public Object {
     inline bool CanIrnTransmit(uint32_t mtu) const {
         uint64_t len_left = m_size >= snd_nxt ? m_size - snd_nxt : 0;
         if (!irn.m_enabled) return true;
-        if (irn.m_bdp == 0) {
-            // Treat zero as "no explicit IRN BDP cap" so custom topologies can still run.
-            return true;
-        }
-
-        return (GetIrnBytesInFlight() + ((len_left > mtu) ? mtu : len_left)) < irn.m_bdp ||
-               (irn.m_highest_ack + irn.m_bdp > snd_nxt);
+        // Retransmissions do not add new sequence space to the BDP window.
+        if (snd_nxt < irn.m_max_seq) return true;
+        const uint64_t nextSize = std::min<uint64_t>(len_left, mtu);
+        return irn.m_bdp > 0 && GetIrnBytesInFlight() + nextSize <= irn.m_bdp;
     }
 };
 
@@ -279,17 +313,14 @@ class RdmaRxQueuePair : public Object {  // Rx side queue pair
    public:
     uint32_t outcount{0};
     uint32_t lastoutseq{0};
-    std::array<uint32_t, BITMAP_SIZE> psnPathGapPsn{};
-    std::array<uint32_t, BITMAP_SIZE> psnPathGapObservedPkts{};
-    std::array<bool, BITMAP_SIZE> psnPathGapNackSent{};
-    std::deque<uint32_t> psnPathGapPendingNacks;
-    uint32_t psnPathEarliestGapPsn{0xffffffffu};
-    Time psnPathEarliestGapStart;
-    EventId psnPathGapTimerEvent;
+    bool psnPacketContextValid{false};
+    bool psnFirstMappingObservation{false};
+    PsnMappingSnapshot psnPacketContext;
     EventId bitmapExpectedTimerEvent;
     uint32_t bitmapExpectedTimeoutSeq{0xffffffffu};
     bool bitmapExpectedNackSent{false};
     std::array<uint8_t, BITMAP_SIZE> bitmap{};
+    std::array<uint32_t, BITMAP_SIZE> psnReceivedSizes{};
     struct ECNAccount {
         uint16_t qIndex;
         uint8_t ecnbits;

@@ -72,8 +72,8 @@ uint32_t PsnPath::GetPsnFromSeq(uint32_t seq, uint32_t packetSize) {
 
 uint32_t PsnPath::GetPathIdFromPsn(uint32_t psn, uint32_t k, uint32_t o, uint32_t activePathCount) {
     if (activePathCount == 0) return 0;
-    if (k == 0) return o % activePathCount;
-    return (o + (psn % k)) % activePathCount;
+    if (k == 0) return 0;
+    return o + psn % k;
 }
 
 uint16_t PsnPath::GetSrcPortFromPsn(uint32_t psn, uint32_t k, uint32_t o, uint16_t basePort,
@@ -85,13 +85,7 @@ uint16_t PsnPath::GetSrcPortFromPsn(uint32_t psn, uint32_t k, uint32_t o, uint16
 bool PsnPath::IsSamePathLoss(uint32_t missingPsn, uint32_t currentPsn, uint32_t k,
                              uint32_t activePathCount) {
     if (k == 0 || activePathCount == 0) return false;
-    uint32_t missingPath = missingPsn % k;
-    uint32_t currentPath = currentPsn % k;
-    if (activePathCount < k) {
-        missingPath %= activePathCount;
-        currentPath %= activePathCount;
-    }
-    return missingPath == currentPath;
+    return missingPsn % k == currentPsn % k;
 }
 
 }  // namespace ns3

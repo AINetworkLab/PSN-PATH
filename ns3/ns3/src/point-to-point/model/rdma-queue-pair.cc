@@ -18,6 +18,96 @@ namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE("RdmaQueuePair");
 
+void PsnPathState::InitializeLanes() {
+    NS_ABORT_MSG_IF(k == 0, "PSN-PATH requires explicit positive K");
+    if (!lanes.empty()) return;
+    NS_ABORT_MSG_IF(basePort == 0 || basePort + uint64_t(k) + o - 1 > UINT16_MAX,
+                    "PSN-PATH source port range exceeds UDP port space");
+    lanes.resize(k);
+    pathStats.resize(k + o);
+    for (auto &stats : pathStats) stats.active = false;
+    for (uint32_t lane = 0; lane < k; ++lane) {
+        lanes[lane].offset = o;
+        pathStats[lane + o].active = true;
+    }
+    activePathCount = k;
+}
+
+uint32_t PsnPathState::SelectPath(uint32_t psn) const {
+    NS_ABORT_MSG_IF(k == 0 || lanes.size() != k, "PSN-PATH lanes are not initialized");
+    const uint32_t lane = psn % k;
+    return lane + lanes[lane].offset;
+}
+
+void PsnPathState::RecordTransmission(uint32_t psn, uint32_t size, bool retransmitted) {
+    auto it = transmissions.find(psn);
+    if (it != transmissions.end()) {
+        it->second.retransmitted = true;
+        return;
+    }
+    // A stale retry already covered by cumulative ACK must not become a new success.
+    if (retransmitted) return;
+    PsnLaneState &lane = lanes[psn % k];
+    if (lane.boundaryPending) {
+        lane.fpsn = psn;
+        lane.boundaryPending = false;
+    }
+    PsnTransmission tx;
+    tx.pathId = SelectPath(psn);
+    tx.epoch = lane.epoch;
+    tx.fpsn = lane.fpsn;
+    tx.offset = lane.offset;
+    tx.size = size;
+    transmissions.emplace(psn, tx);
+}
+
+bool PsnPathState::ReplacePath(uint32_t laneId) {
+    PsnLaneState &lane = lanes[laneId];
+    const uint32_t oldPath = laneId + lane.offset;
+    uint32_t nextPath = oldPath;
+    // Search source-port space without changing the logical lane or other lanes.
+    while (++nextPath + uint64_t(basePort) <= UINT16_MAX) {
+        bool occupied = false;
+        for (uint32_t other = 0; other < k; ++other) {
+            if (other != laneId && SelectPath(other) == nextPath) occupied = true;
+        }
+        if (occupied) continue;
+        pathStats[oldPath].active = false;
+        pathStats[oldPath].probing = false;
+        if (pathStats.size() <= nextPath) pathStats.resize(nextPath + 1);
+        pathStats[nextPath] = PsnPathStats{};
+        pathStats[nextPath].active = true;
+        lane.offset = nextPath - laneId;
+        lane.epoch = ++mappingEpoch;
+        lane.boundaryPending = true;
+        return true;
+    }
+    return false;
+}
+
+void PsnPathState::RecordFeedback(uint32_t ackSeq, bool loss,
+                                  uint32_t nackSeq, uint32_t nackSize) {
+    if (packetSize == 0) return;
+    // Count losses first: a NACK can also carry cumulative progress.
+    if (loss && nackSize != 0) {
+        const uint64_t end = uint64_t(nackSeq) + nackSize;
+        for (auto it = transmissions.lower_bound(nackSeq / packetSize);
+             it != transmissions.end() && uint64_t(it->first) * packetSize < end; ++it) {
+            PsnTransmission &tx = it->second;
+            if (!tx.lossCounted) {
+                ++pathStats[tx.pathId].nackCount;
+                tx.lossCounted = true;
+            }
+        }
+    }
+    for (auto it = transmissions.begin(); it != transmissions.end();) {
+        PsnTransmission &tx = it->second;
+        if (uint64_t(it->first) * packetSize + tx.size > ackSeq) break;
+        if (!tx.retransmitted && !tx.lossCounted) ++pathStats[tx.pathId].ackCount;
+        it = transmissions.erase(it);
+    }
+}
+
 /**************************
  * RdmaQueuePair
  *************************/
@@ -82,9 +172,13 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
     dctcp.m_batchSizeOfAlpha = 0;
 
     irn.m_enabled = false;
+    irn.m_selectiveRetrans = true;
     irn.m_highest_ack = 0;
     irn.m_max_seq = 0;
     irn.m_recovery = false;
+    irn.m_recovery_seq = 0;
+    irn.m_retransmitFirst = false;
+    irn.m_bdp = 0;
 
     m_timeout = MilliSeconds(4);
     m_selectiveAckedBytes = 0;
@@ -110,17 +204,33 @@ void RdmaQueuePair::SetFlowId(int32_t v) {
 void RdmaQueuePair::SetTimeout(Time v) { m_timeout = v; }
 
 uint64_t RdmaQueuePair::GetBytesLeft() {
-    if (irn.m_enabled) {
-        uint32_t sack_seq, sack_sz;
-        if (irn.m_sack.peekFrontBlock(&sack_seq, &sack_sz)) {
-            if (snd_nxt == sack_seq) {
-                snd_nxt += sack_sz;
-                irn.m_sack.discardUpTo(snd_nxt);
-            }
-        }
-    }
-
+    PrepareIrnTransmission();
     return m_size >= snd_nxt ? m_size - snd_nxt : 0;
+}
+
+void RdmaQueuePair::PrepareIrnTransmission() {
+    if (!irn.m_enabled || !irn.m_selectiveRetrans || psnPath.pathAwareRetransEnabled) return;
+    uint32_t end;
+    if (irn.m_sack.blockContaining(static_cast<uint32_t>(snd_nxt), &end)) {
+        snd_nxt = end;
+    }
+    // Only the first retransmission is unconditional. Later holes require a
+    // higher SACK; an unacknowledged tail may still be in flight.
+    if (irn.m_recovery && !irn.m_retransmitFirst &&
+        snd_nxt < irn.m_max_seq && snd_nxt >= irn.m_sack.highestSackEnd()) {
+        snd_nxt = irn.m_max_seq;
+    }
+}
+
+void RdmaQueuePair::StartIrnRecovery() {
+    if (!irn.m_recovery) {
+        // Byte ACKs are exclusive: ACK >= this boundary acknowledges the last
+        // regular packet sent before recovery.
+        irn.m_recovery_seq = irn.m_max_seq;
+    }
+    irn.m_recovery = true;
+    irn.m_retransmitFirst = true;
+    snd_nxt = snd_una;
 }
 
 uint32_t RdmaQueuePair::GetHash(void) {
@@ -186,16 +296,6 @@ uint64_t RdmaQueuePair::HpGetCurWin() {
 }
 
 bool RdmaQueuePair::IsFinished() {
-    if (irn.m_enabled) {
-        uint32_t sack_seq, sack_sz;
-        if (irn.m_sack.peekFrontBlock(&sack_seq, &sack_sz)) {
-            if (snd_nxt == sack_seq) {
-                snd_nxt += sack_sz;
-                irn.m_sack.discardUpTo(snd_nxt);
-            }
-        }
-    }
-
     return snd_una >= m_size;
 }
 
@@ -217,11 +317,6 @@ RdmaRxQueuePair::RdmaRxQueuePair() {
     m_lastNackReason = "";
     m_ackSeqOverrideValid = false;
     m_ackSeqOverride = 0;
-    psnPathEarliestGapPsn = 0xffffffffu;
-    psnPathEarliestGapStart = Time(0);
-    if (psnPathGapTimerEvent.IsRunning()) {
-        psnPathGapTimerEvent.Cancel();
-    }
     bitmapExpectedTimeoutSeq = 0xffffffffu;
     bitmapExpectedNackSent = false;
     if (bitmapExpectedTimerEvent.IsRunning()) {
@@ -413,6 +508,21 @@ bool IrnSackManager::peekFrontBlock(uint32_t* pseq, uint32_t* psize) {
     *pseq = it->first;
     *psize = it->second;
     return true;
+}
+
+bool IrnSackManager::blockContaining(uint32_t seq, uint32_t *end) const {
+    for (const auto &block : m_data) {
+        if (block.first > seq) break;
+        if (seq - block.first < block.second) {
+            *end = block.first + block.second;
+            return true;
+        }
+    }
+    return false;
+}
+
+uint32_t IrnSackManager::highestSackEnd() const {
+    return m_data.empty() ? 0 : m_data.back().first + m_data.back().second;
 }
 
 size_t IrnSackManager::getSackBufferOverhead() {

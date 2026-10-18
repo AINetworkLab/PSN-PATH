@@ -48,6 +48,8 @@ class PsnPathTag : public Tag {
 
 class PsnPath {
    public:
+    // Paper control word: K (2 bytes), offset (2 bytes), FPSN (3 bytes).
+    static const uint32_t kControlBytes = 2 + 2 + 3;
     static uint32_t GetPsnFromSeq(uint32_t seq, uint32_t packetSize);
     static uint32_t GetPathIdFromPsn(uint32_t psn, uint32_t k, uint32_t o,
                                      uint32_t activePathCount);

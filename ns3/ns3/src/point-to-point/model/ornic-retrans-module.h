@@ -18,18 +18,13 @@ struct OrnicRxFeedback {
     uint32_t nackSize{0};
     uint32_t gap{0};
     double otd{0.0};
-    uint64_t mddNs{0};
-    uint64_t rttMinNs{0};
-    uint64_t rttMaxNs{0};
 };
 
 class OrnicRetransModule {
    public:
-    void SetWindowSize(uint32_t windowSize);
-    void SetBandwidthGbps(double bandwidthGbps);
     void RegisterTxFlow(const RdmaFlowKey &key);
     void UnregisterTxFlow(const RdmaFlowKey &key);
-    void RegisterRxFlow(const RdmaFlowKey &key);
+    void RegisterRxFlow(const RdmaFlowKey &key, double otd);
     void UnregisterRxFlow(const RdmaFlowKey &key);
 
     void OnPacketSent(const RdmaFlowKey &key, uint32_t seq, uint32_t size, bool isRetrans);
@@ -39,7 +34,7 @@ class OrnicRetransModule {
     void ClearRetransMarker(const RdmaFlowKey &key, uint32_t seq);
 
     OrnicRxFeedback OnData(const RdmaFlowKey &key, uint32_t seq, uint32_t size,
-                           uint32_t packetSize, uint64_t oneWayDelayNs);
+                           uint32_t packetSize);
 
    private:
     struct TxSegment {
@@ -53,13 +48,11 @@ class OrnicRetransModule {
     };
 
     struct RxState {
+        double otd{0.0};
         uint32_t expectedSeq{0};
-        std::deque<uint64_t> delaySamplesNs;
         std::unordered_map<uint32_t, uint32_t> outOfOrder;
     };
 
-    uint32_t m_windowSize{4};
-    double m_bandwidthGbps{0.0};
     std::unordered_map<RdmaFlowKey, TxState, RdmaFlowKeyHash> m_txStates;
     std::unordered_map<RdmaFlowKey, RxState, RdmaFlowKeyHash> m_rxStates;
 };
