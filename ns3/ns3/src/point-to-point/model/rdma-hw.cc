@@ -464,9 +464,9 @@ TypeId RdmaHw::GetTypeId(void) {
             .AddAttribute("PsnPathTRemove", "Remove threshold for path manager",
                           DoubleValue(PsnPathScore::UnsetThreshold()), MakeDoubleAccessor(&RdmaHw::m_psnPathTRemove),
                           MakeDoubleChecker<double>())
-            .AddAttribute("PsnPathEvalIntervalUs", "Path evaluation interval in microseconds",
-                          DoubleValue(0), MakeDoubleAccessor(&RdmaHw::m_psnPathEvalIntervalUs),
-                          MakeDoubleChecker<double>())
+            .AddAttribute("PsnPathProbeFrequency", "Explicit initial DT-Switch step f (old-path packets per candidate packet)",
+                          UintegerValue(0), MakeUintegerAccessor(&RdmaHw::m_psnPathProbeFrequency),
+                          MakeUintegerChecker<uint32_t>())
             .AddAttribute("L2Timeout", "Sender's timer of waiting for the ack",
                           TimeValue(MilliSeconds(4)), MakeTimeAccessor(&RdmaHw::m_waitAckTimeout),
                           MakeTimeChecker());
@@ -501,7 +501,7 @@ RdmaHw::RdmaHw() {
     m_psnPathNormalizedTRemove = PsnPathScore::UnsetThreshold();
     m_psnPathTExplore = PsnPathScore::UnsetThreshold();
     m_psnPathTRemove = PsnPathScore::UnsetThreshold();
-    m_psnPathEvalIntervalUs = 0;
+    m_psnPathProbeFrequency = 0;
     m_enableConsoleLog = 0;
     m_consoleLogPsns = "";
 }
@@ -600,6 +600,14 @@ void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Addre
     }
     qp->hp.pathState.assign(qp->psnPath.k, HpPathState{});
     if (qp->psnPath.pathSelectionEnabled) qp->psnPath.InitializeLanes();
+    if (qp->psnPath.pathSwitchEnabled) {
+        const double explore = m_enablePsnPathNormalizedScore ? m_psnPathNormalizedTExplore : m_psnPathTExplore;
+        const double remove = m_enablePsnPathNormalizedScore ? m_psnPathNormalizedTRemove : m_psnPathTRemove;
+        NS_ABORT_MSG_IF(explore > remove &&
+                        (GetPsnPathControlBytes() == 0 || m_psnPathProbeFrequency == 0 ||
+                         m_psnPathProbeFrequency > 0x7f),
+                        "DT-Switch exploration requires PSN-PATH recovery and an explicit probe step fitting seven bits");
+    }
     qp->ornic.enabled = m_enableOrnic;
     qp->ornic.packetSize = m_mtu == 0 ? 1 : m_mtu;
 
@@ -746,7 +754,7 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch) {
     PsnPathTag pt;
     bool hasPsnPathTag = p->PeekPacketTag(pt);
     if (hasPsnPathTag) {
-        const uint32_t controlBytes = GetPsnPathControlBytes();
+        const uint32_t controlBytes = GetPsnPathControlBytes(pt);
         NS_ABORT_MSG_IF(payload_size < controlBytes, "Truncated PSN-PATH control word");
         payload_size -= controlBytes;
     }
@@ -789,31 +797,22 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch) {
         }
     }
     rxQp->psnPacketContextValid = hasPsnPathTag;
+    rxQp->psnPacketAccepted = false;
     rxQp->psnFirstMappingObservation = false;
     if (hasPsnPathTag) {
         NS_ABORT_MSG_IF(pt.GetK() == 0, "PSN-PATH packet has no logical lane count");
         PsnMappingSnapshot context;
-        context.epoch = pt.GetEpoch();
         context.k = pt.GetK();
         context.o = pt.GetO();
         context.fpsn = pt.GetFpsn();
         context.lane = (ch.udp.seq / (m_psnPathPacketSize == 0 ? m_mtu : m_psnPathPacketSize)) % context.k;
+        context.phaseStart = pt.HasPhaseInfo() ? pt.GetPhaseStart() : context.lane;
         context.pathId = pt.GetPathId();
-        context.retransmission = context.pathId != context.lane + context.o;
+        context.probeStep = pt.GetProbeStep();
+        context.candidateOffset = pt.GetCandidateOffset();
+        context.retransmission = pt.IsRetransmission() ||
+            context.pathId != context.PathForPsn(ch.udp.seq / (m_psnPathPacketSize == 0 ? m_mtu : m_psnPathPacketSize));
         rxQp->psnPacketContext = context;
-        if (!context.retransmission) {
-            bool found = false;
-            uint32_t latestEpoch = 0;
-            for (auto &entry : rxQp->psnMappingHistory) {
-                if (entry.lane == context.lane) latestEpoch = std::max(latestEpoch, entry.epoch);
-                if (entry.lane == context.lane && entry.epoch == context.epoch) {
-                    found = true;
-                    break;
-                }
-            }
-            rxQp->psnFirstMappingObservation = context.epoch > latestEpoch;
-            if (!found) rxQp->psnMappingHistory.push_back(context);
-        }
     }
 
     bool cnp_check = false;
@@ -904,7 +903,7 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch) {
                       << " pathId=" << pt.GetPathId()
                       << " flowSport=" << pt.GetFlowSport()
                       << " k=" << pt.GetK()
-                      << " epoch=" << pt.GetEpoch()
+                      << " phaseStart=" << pt.GetPhaseStart()
                       << " probe=" << static_cast<uint32_t>(pt.GetProbe())
                       << " cumAckPsn=" << (falconFeedback.ack.cumAckSeq / packetSize)
                       << " bitmapBits=" << falconFeedback.ack.bitmapBits
@@ -988,6 +987,12 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch) {
             }
         } else if (m_enableBitmapRetrans) {
             seqh.SetSeq(bitmapFeedback.ackSeq);
+        } else if (hasPsnPathTag && GetPsnPathControlBytes() != 0 && m_enablePathSwitch &&
+                   x == 1 && rxQp->psnPacketAccepted) {
+            // Reuse the existing selective-feedback tuple to acknowledge this
+            // admitted packet even when a different lane blocks cumulative ACK.
+            seqh.SetIrnNack(receivedSeq);
+            seqh.SetIrnNackSize(payload_size);
         } else if (m_enableRxOooNack && x == 2) {
             seqh.SetDirectNack();
             seqh.SetIrnNack(seqForCheck);
@@ -1004,6 +1009,15 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch) {
                    x == 2) {
             seqh.SetIrnNack(seqForCheck);
             seqh.SetIrnNackSize(payload_size);
+        }
+
+        if (x == 2 && rxQp->psnNackRangeValid && hasPsnPathTag &&
+            GetPsnPathControlBytes() != 0) {
+            const PsnPathNackRange &range = rxQp->psnNackRange;
+            const uint32_t packetSize = m_psnPathPacketSize == 0 ? m_mtu : m_psnPathPacketSize;
+            seqh.SetIrnNack(range.startPsn * packetSize);
+            seqh.SetIrnNackSize(packetSize);
+            seqh.SetPsnPathNackRange(range.pathId, range.k, range.endPsn);
         }
 
         if (x == 2) {
@@ -1189,9 +1203,33 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch) {
         }
     }
 
+    const bool isPsnRangeNack = ch.l3Prot == 0xFD &&
+        ((ch.ack.flags >> qbbHeader::FLAG_PSN_PATH_RANGE) & 1) != 0;
+    if (isPsnRangeNack) {
+        NS_ABORT_MSG_IF(!qp->psnPath.pathSelectionEnabled ||
+                        !qp->psnPath.pathAwareRetransEnabled || qp->psnPath.packetSize == 0 ||
+                        ch.ack.irnNack % qp->psnPath.packetSize != 0,
+                        "PSN-PATH range NACK requires path-aware recovery and an aligned sequence");
+        PsnPathNackRange range;
+        range.pathId = ch.ack.falconBitmapHi;
+        range.k = ch.ack.falconBitmapBits;
+        range.startPsn = ch.ack.irnNack / qp->psnPath.packetSize;
+        range.endPsn = ch.ack.falconBitmapLo;
+        qp->psnPath.RecordPathNack(range, std::max<uint64_t>(seq, qp->snd_una));
+        qp->irn.m_recovery = true;
+        if (m_hpccTrace) {
+            std::cout << "[PSN_PATH_NACK_RANGE] path=" << range.pathId
+                      << " k=" << range.k << " startPsn=" << range.startPsn
+                      << " endPsn=" << range.endPsn << std::endl;
+        }
+    }
     if (qp->psnPath.pathSelectionEnabled) {
-        const bool loss = (ch.l3Prot == 0xFD) && ch.ack.irnNackSize != 0;
-        qp->psnPath.RecordFeedback(seq, loss, ch.ack.irnNack, ch.ack.irnNackSize);
+        const bool loss = (ch.l3Prot == 0xFD) && ch.ack.irnNackSize != 0 && !isPsnRangeNack;
+        const bool delivery = GetPsnPathControlBytes() != 0 && m_enablePathSwitch &&
+            ch.l3Prot == 0xFC && ch.ack.irnNackSize != 0;
+        qp->psnPath.RecordFeedback(seq, loss, ch.ack.irnNack, ch.ack.irnNackSize,
+                                   delivery, ch.ack.irnNack, ch.ack.irnNackSize);
+        qp->stat.pathSwitchCount = qp->psnPath.switchCount;
     }
 
     uint32_t nic_idx = GetNicIdxOfQp(qp);
@@ -1509,7 +1547,8 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch) {
             // generate regular ACKs for in-order progress, so do not force NACK-only handling.
             if (seq > qp->irn.m_highest_ack) qp->irn.m_highest_ack = seq;
 
-            if (((ch.ack.flags >> qbbHeader::FLAG_DIRECT_NACK) & 1) == 0 &&
+            if (!qp->psnPath.pathAwareRetransEnabled &&
+                ((ch.ack.flags >> qbbHeader::FLAG_DIRECT_NACK) & 1) == 0 &&
                 ch.ack.irnNackSize != 0) {
                 // ch.ack.irnNack contains the seq triggered this NACK
                 uint32_t previousSackEnd = qp->irn.m_sack.highestSackEnd();
@@ -1543,7 +1582,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch) {
             }
 
             if (qp->psnPath.pathAwareRetransEnabled &&
-                ch.ack.irnNackSize != 0) {
+                ch.l3Prot == 0xFD && ch.ack.irnNackSize != 0 && !isPsnRangeNack) {
                 uint32_t startPsn =
                     PsnPath::GetPsnFromSeq(ch.ack.irnNack, qp->psnPath.packetSize);
                 uint32_t endPsn = startPsn;
@@ -1554,15 +1593,14 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch) {
                 bool duplicated = false;
                 for (size_t idx = 0; idx < qp->psnPath.pendingRetrans.size(); ++idx) {
                     const PsnRetransRequest &req = qp->psnPath.pendingRetrans[idx];
-                    if (req.startPsn == startPsn && req.endPsn == endPsn &&
-                        req.epoch == qp->psnPath.mappingEpoch) {
+                    if (req.startPsn <= startPsn && req.endPsn >= endPsn) {
                         duplicated = true;
                         break;
                     }
                 }
-                if (!duplicated) {
+                if (!duplicated && uint64_t(endPsn) * qp->psnPath.packetSize >= qp->snd_una) {
                     PsnRetransRequest req;
-                    req.startPsn = startPsn;
+                    req.startPsn = std::max<uint32_t>(startPsn, qp->snd_una / qp->psnPath.packetSize);
                     req.endPsn = endPsn;
                     req.epoch = qp->psnPath.mappingEpoch;
                     qp->psnPath.pendingRetrans.push_back(req);
@@ -1582,7 +1620,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch) {
                 qp->snd_nxt = qp->snd_una;
             }
             if (qp->psnPath.pathAwareRetransEnabled && ch.l3Prot == 0xFD &&
-                ch.ack.irnNackSize != 0) {
+                ch.ack.irnNackSize != 0 && !isPsnRangeNack) {
                 uint32_t startPsn =
                     PsnPath::GetPsnFromSeq(ch.ack.irnNack, qp->psnPath.packetSize);
                 uint32_t endPsn = startPsn;
@@ -1813,7 +1851,7 @@ int RdmaHw::ReceiverCheckSeq(uint32_t &seq, Ptr<RdmaRxQueuePair> q, uint32_t siz
                 m_ack_interval;  // if ack_interval is small (e.g., 1), condition is meaningless
             logRecvCheck("ACK", "IN_ORDER");
             return 1;            // Generate ACK
-        } else if (q->ReceiverNextExpectedSeq % m_chunk == 0) {
+        } else if (m_chunk != 0 && q->ReceiverNextExpectedSeq % m_chunk == 0) {
             logRecvCheck("ACK", "IN_ORDER_CHUNK");
             return 1;
         } else {
@@ -1898,28 +1936,34 @@ int RdmaHw::ReceiverCheckSeq(uint32_t &seq, Ptr<RdmaRxQueuePair> q, uint32_t siz
 
 int RdmaHw::ReceiverCheckSeqPsnPath(uint32_t &seq, Ptr<RdmaRxQueuePair> q, uint32_t size, bool &cnp) {
     cnp = false;
+    q->psnNackRangeValid = false;
     uint32_t origSeq = seq;
     uint32_t packetSize = m_psnPathPacketSize == 0 ? m_mtu : m_psnPathPacketSize;
     uint32_t epsn = q->ReceiverNextExpectedSeq / packetSize;
     uint32_t psn = seq / packetSize;
     const uint32_t k = q->psnPacketContextValid ? q->psnPacketContext.k : m_psnPathK;
     NS_ABORT_MSG_IF(k == 0, "PSN-PATH receiver requires positive K");
-    auto resolveSnapshot = [&](uint32_t targetPsn) -> PsnMappingSnapshot {
-        PsnMappingSnapshot best;
-        best.k = k;
-        best.o = m_psnPathO;
-        best.lane = targetPsn % k;
-        best.pathId = best.lane + best.o;
-        for (const auto &entry : q->psnMappingHistory) {
-            if (entry.lane == best.lane && targetPsn >= entry.fpsn && entry.fpsn >= best.fpsn) {
-                best = entry;
-            }
-        }
-        return best;
-    };
-    auto mappedPath = [&](uint32_t targetPsn) -> uint32_t {
-        return resolveSnapshot(targetPsn).pathId;
-    };
+    PsnMappingSnapshot context;
+    if (q->psnPacketContextValid) {
+        context = q->psnPacketContext;
+    } else {
+        context.k = k;
+        context.o = m_psnPathO;
+        context.lane = psn % k;
+        context.fpsn = context.lane;
+        context.phaseStart = context.lane;
+        context.pathId = context.PathForPsn(psn);
+    }
+    q->psnFirstMappingObservation = false;
+    if (origSeq >= q->ReceiverNextExpectedSeq &&
+        uint64_t(psn) < uint64_t(epsn) + BITMAP_SIZE &&
+        context.pathId == context.PathForPsn(psn)) {
+        q->psnFirstMappingObservation = q->ObservePsnMapping(context);
+    }
+    uint32_t prevPsn = 0;
+    const bool hasPrevious = q->FindPsnPredecessor(context, psn, prevPsn);
+    const bool prevReceived = hasPrevious &&
+        (prevPsn < epsn || q->bitmap[prevPsn % BITMAP_SIZE] != 0);
     auto formatBitmapWindow = [&](uint32_t startPsn, uint32_t endPsn) -> std::string {
         std::ostringstream oss;
         oss << "[";
@@ -1937,26 +1981,18 @@ int RdmaHw::ReceiverCheckSeqPsnPath(uint32_t &seq, Ptr<RdmaRxQueuePair> q, uint3
               IsPsnInList(psn, m_consoleLogPsns))) {
             return;
         }
-        uint32_t currentPath = mappedPath(psn);
+        const uint32_t currentPath = context.pathId;
         uint32_t startPsn = epsn <= psn ? epsn : psn;
-        uint32_t firstMissingSamePath = UINT32_MAX;
-        if (epsn <= psn) {
-            for (uint32_t p = epsn; p < psn; ++p) {
-                if (mappedPath(p) == currentPath && q->bitmap[p % BITMAP_SIZE] == 0) {
-                    firstMissingSamePath = p;
-                    break;
-                }
-            }
-        }
+        const uint32_t missingPredecessor = hasPrevious && !prevReceived ? prevPsn : UINT32_MAX;
         std::cout << "[PSN_TRACE_RECV] t=" << Simulator::Now().GetNanoSeconds()
                   << " node=" << m_node->GetId() << " seq=" << origSeq << " psn=" << psn
                   << " expectedPsn=" << epsn << " prevPsn=" << prevPsn
                   << " prevReceived=" << (prevReceived ? 1 : 0)
                   << " earlierLossFound=" << (earlierLossFound ? 1 : 0)
-                  << " firstMissingSamePath="
-                  << (firstMissingSamePath == UINT32_MAX
+                  << " missingPredecessor="
+                  << (missingPredecessor == UINT32_MAX
                           ? -1
-                          : static_cast<int64_t>(firstMissingSamePath))
+                          : static_cast<int64_t>(missingPredecessor))
                   << " decision=" << decision << " reason=" << reason
                   << " currentPath=" << currentPath
                   << " bitmapWindow=" << formatBitmapWindow(startPsn, psn)
@@ -1971,18 +2007,16 @@ int RdmaHw::ReceiverCheckSeqPsnPath(uint32_t &seq, Ptr<RdmaRxQueuePair> q, uint3
                   << " expectedPsn=" << epsn << " prevPsn=" << prevPsn
                   << " prevReceived=" << (prevReceived ? 1 : 0)
                   << " decision=" << decision << " reason=" << reason
-                  << " currentPath=" << mappedPath(psn) << std::endl;
+                  << " currentPath=" << context.pathId << std::endl;
     };
-    uint32_t pathStride = k;
     if (origSeq < q->ReceiverNextExpectedSeq) {
-        uint32_t prevPsn = psn >= pathStride ? psn - pathStride : 0;
-        bool prevReceived = psn >= pathStride ? (q->bitmap[prevPsn % BITMAP_SIZE] != 0) : false;
         logTrackedPsn("ACK", "DUPLICATE_OR_OLD", prevPsn, prevReceived, false);
         logRecvCheck("ACK", "DUPLICATE_OR_OLD", prevPsn, prevReceived);
         return 1;
     }
 
     if (psn == epsn) {
+        q->psnPacketAccepted = true;
         q->bitmap[psn % BITMAP_SIZE] = 0;
         q->ReceiverNextExpectedSeq += size;
         uint32_t nextPsn = q->ReceiverNextExpectedSeq / packetSize;
@@ -1993,8 +2027,6 @@ int RdmaHw::ReceiverCheckSeqPsnPath(uint32_t &seq, Ptr<RdmaRxQueuePair> q, uint3
             nextPsn++;
         }
         seq = q->ReceiverNextExpectedSeq;
-        uint32_t prevPsn = psn >= pathStride ? psn - pathStride : 0;
-        bool prevReceived = psn >= pathStride ? (q->bitmap[prevPsn % BITMAP_SIZE] != 0) : false;
         logTrackedPsn("ACCEPT", "IN_ORDER", prevPsn, prevReceived, false);
         logRecvCheck("ACCEPT", "IN_ORDER", prevPsn, prevReceived);
         return size == 0 ? 6 : 1;
@@ -2004,62 +2036,49 @@ int RdmaHw::ReceiverCheckSeqPsnPath(uint32_t &seq, Ptr<RdmaRxQueuePair> q, uint3
         seq = q->ReceiverNextExpectedSeq;
         cnp = false;
         q->m_lastNackReason = "BITMAP_WINDOW_OVERFLOW";
-        uint32_t prevPsn = psn >= pathStride ? psn - pathStride : 0;
-        bool prevReceived = psn >= pathStride ? (q->bitmap[prevPsn % BITMAP_SIZE] != 0) : false;
-        logTrackedPsn("DROP", "WINDOW_OVERFLOW", prevPsn, prevReceived, false);
-        logRecvCheck("DROP", "WINDOW_OVERFLOW", prevPsn, prevReceived);
-        // Buffer pressure is not proof of a physical-path loss. Report only
-        // cumulative progress; the sender RTO remains the recovery backstop.
-        return 1;
+        logTrackedPsn("NACK", "WINDOW_OVERFLOW", prevPsn, prevReceived, false);
+        logRecvCheck("NACK", "WINDOW_OVERFLOW", prevPsn, prevReceived);
+        return 2;
     }
 
     q->bitmap[psn % BITMAP_SIZE] = 1;
     q->psnReceivedSizes[psn % BITMAP_SIZE] = size;
-    const PsnMappingSnapshot context = q->psnPacketContextValid
-        ? q->psnPacketContext : resolveSnapshot(psn);
-    uint32_t currentPath = context.pathId;
-    // A retry can travel on a different physical route. It is not FIFO evidence
-    // for losses among the original packets on that route.
-    if (context.retransmission || q->psnFirstMappingObservation || psn == context.fpsn) return 1;
-    bool earlierLossFound = false;
-    for (uint32_t i = epsn; i < psn; ++i) {
-        if (i % k != psn % k || mappedPath(i) != currentPath ||
-            resolveSnapshot(i).epoch != context.epoch) {
-            continue;
-        }
-        if (q->bitmap[i % BITMAP_SIZE] == 0) {
-            earlierLossFound = true;
-            uint32_t missingSeq = i * packetSize;
-            uint32_t prevPsn = psn >= pathStride ? psn - pathStride : 0;
-            bool prevReceived = psn >= pathStride ? (q->bitmap[prevPsn % BITMAP_SIZE] != 0) : false;
-            if (Simulator::Now() >= q->m_nackTimer || q->m_lastNACK != missingSeq) {
-                q->m_nackTimer = Simulator::Now() + MicroSeconds(m_nack_interval);
-                q->m_lastNACK = missingSeq;
-                q->m_lastNackReason = "SAME_PATH_GAP";
-                seq = missingSeq;
-                cnp = false;
-                logTrackedPsn("NACK", "SAME_PATH_GAP", prevPsn, prevReceived, earlierLossFound);
-                logRecvCheck("NACK", "SAME_PATH_GAP", prevPsn, prevReceived);
-                if (m_hpccTrace) {
-                    std::cout << "[NACK_GEN] t=" << Simulator::Now().GetNanoSeconds()
-                              << " node=" << m_node->GetId() << " missingPsn=" << i
-                              << " currentPsn=" << psn << " pathId=" << currentPath
-                              << " reason=SAME_PATH_GAP" << std::endl;
-                }
-                return 2;
+    q->psnPacketAccepted = true;
+    // A rerouted retry is not FIFO evidence for the original mapping. A retry
+    // on its original route uses the same predecessor check as a normal packet.
+    if (context.pathId != context.PathForPsn(psn) ||
+        q->psnFirstMappingObservation || !hasPrevious) return 1;
+    if (!prevReceived) {
+        PsnPathNackRange range;
+        NS_ABORT_MSG_IF(!q->FindPsnLossRange(context, psn, epsn, range),
+                        "PSN-PATH predecessor loss has no recoverable range");
+        const uint32_t missingSeq = range.startPsn * packetSize;
+        if (Simulator::Now() >= q->m_nackTimer || q->m_lastNACK != missingSeq) {
+            q->psnNackRange = range;
+            q->psnNackRangeValid = true;
+            q->m_nackTimer = Simulator::Now() + MicroSeconds(m_nack_interval);
+            q->m_lastNACK = missingSeq;
+            q->m_lastNackReason = "SAME_PATH_GAP";
+            seq = missingSeq;
+            cnp = false;
+            logTrackedPsn("NACK", "SAME_PATH_GAP", prevPsn, false, true);
+            logRecvCheck("NACK", "SAME_PATH_GAP", prevPsn, false);
+            if (m_hpccTrace) {
+                std::cout << "[NACK_GEN] t=" << Simulator::Now().GetNanoSeconds()
+                          << " node=" << m_node->GetId() << " missingPsn=" << prevPsn
+                          << " currentPsn=" << psn << " pathId=" << context.pathId
+                          << " reason=SAME_PATH_GAP" << std::endl;
             }
-            logTrackedPsn("HOLD", "SAME_PATH_GAP_DUP_NACK", prevPsn, prevReceived,
-                          earlierLossFound);
-            logRecvCheck("HOLD", "SAME_PATH_GAP_DUP_NACK", prevPsn, prevReceived);
-            return 4;
+            return 2;
         }
+        logTrackedPsn("HOLD", "SAME_PATH_GAP_DUP_NACK", prevPsn, false, true);
+        logRecvCheck("HOLD", "SAME_PATH_GAP_DUP_NACK", prevPsn, false);
+        return 4;
     }
 
-    uint32_t prevPsn = psn >= pathStride ? psn - pathStride : 0;
-    bool prevReceived = psn >= pathStride ? (q->bitmap[prevPsn % BITMAP_SIZE] != 0) : false;
     logTrackedPsn("ACCEPT", "CROSS_PATH_OOO", prevPsn, prevReceived, false);
     logRecvCheck("ACCEPT", "CROSS_PATH_OOO", prevPsn, prevReceived);
-    return 5;
+    return m_enablePathSwitch ? 1 : 5;
 }
 
 void RdmaHw::UpdateBitmapExpectedTimeout(Ptr<RdmaRxQueuePair> q,
@@ -2351,30 +2370,18 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp) {
         m_txDataPacketCallback(qp->sip, qp->dip, payload_size, isRetrans);
     }
 
-    Ptr<Packet> p = Create<Packet>(payload_size +
-        (qp->psnPath.pathSelectionEnabled ? GetPsnPathControlBytes() : 0));
-    if (m_enableFalcon || m_enableOrnic) {
-        RetransmissionTimestampTag timestamp;
-        timestamp.SetNanoseconds(Simulator::Now().GetNanoSeconds());
-        p->AddPacketTag(timestamp);
-    }
-    // add SeqTsHeader
-    SeqTsHeader seqTs;
-    seqTs.SetSeq(seq);
-    seqTs.SetPG(qp->m_pg);
-    p->AddHeader(seqTs);
-    // add udp header
-    UdpHeader udpHeader;
-    udpHeader.SetDestinationPort(qp->dport);
     uint16_t sourcePort = qp->sport;
     uint32_t selectedPathId = 0;
     uint8_t probeFlag = 0;
     if (qp->psnPath.pathSelectionEnabled) {
         uint32_t psn = PsnPath::GetPsnFromSeq(seq, qp->psnPath.packetSize);
         qp->psnPath.InitializeLanes();
-        selectedPathId = qp->psnPath.SelectPath(psn);
-        sourcePort = static_cast<uint16_t>(qp->psnPath.basePort + selectedPathId);
         qp->psnPath.RecordTransmission(psn, payload_size, isRetrans);
+        auto original = qp->psnPath.transmissions.find(psn);
+        selectedPathId = !isRetrans && original != qp->psnPath.transmissions.end()
+            ? original->second.pathId : qp->psnPath.SelectPath(psn);
+        probeFlag = !isRetrans && original != qp->psnPath.transmissions.end() && original->second.probe;
+        sourcePort = static_cast<uint16_t>(qp->psnPath.basePort + selectedPathId);
         if (m_hpccTrace) {
             std::cout << "[SEND_SELECT] t=" << Simulator::Now().GetNanoSeconds()
                       << " qp=" << qp->m_flow_id << " seq=" << seq << " psn=" << psn
@@ -2388,9 +2395,47 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp) {
                       << " activePaths="
                       << FormatPathIndices(CollectActivePathIndices(qp->psnPath.pathStats))
                       << " probe=" << static_cast<uint32_t>(probeFlag)
+                      << " step=" << qp->psnPath.lanes[psn % qp->psnPath.k].probeStep
+                      << " candidateOffset=" << qp->psnPath.lanes[psn % qp->psnPath.k].candidateOffset
                       << " pendingRetrans=" << qp->psnPath.pendingRetrans.size() << std::endl;
         }
     }
+    PsnPathTag psnTag;
+    if (qp->psnPath.pathSelectionEnabled) {
+        const uint32_t psn = seq / qp->psnPath.packetSize;
+        const PsnLaneState &lane = qp->psnPath.lanes[psn % qp->psnPath.k];
+        auto original = qp->psnPath.transmissions.find(psn);
+        const bool hasOriginal = original != qp->psnPath.transmissions.end();
+        if (hasOriginal ? original->second.hasPhaseInfo :
+            (lane.probeStep != 0 || lane.phaseClosing)) {
+            psnTag.SetPhaseStart(hasOriginal ? original->second.phaseStart : lane.phaseStart);
+            psnTag.SetExplore(hasOriginal ? original->second.probeStep : lane.probeStep,
+                              hasOriginal ? original->second.candidateOffset : lane.candidateOffset);
+        }
+        psnTag.SetK(qp->psnPath.k);
+        psnTag.SetO(hasOriginal ? original->second.offset : lane.offset);
+        psnTag.SetFpsn(hasOriginal ? original->second.fpsn : lane.fpsn);
+        psnTag.SetActivePathMask(BuildActivePathMask(qp->psnPath.pathStats));
+        psnTag.SetPathId(selectedPathId);
+        psnTag.SetProbe(probeFlag);
+        psnTag.SetRetransmission(isRetrans);
+        psnTag.SetFlowSport(qp->sport);
+    }
+    Ptr<Packet> p = Create<Packet>(payload_size +
+        (qp->psnPath.pathSelectionEnabled ? GetPsnPathControlBytes(psnTag) : 0));
+    if (m_enableFalcon || m_enableOrnic) {
+        RetransmissionTimestampTag timestamp;
+        timestamp.SetNanoseconds(Simulator::Now().GetNanoSeconds());
+        p->AddPacketTag(timestamp);
+    }
+    // add SeqTsHeader
+    SeqTsHeader seqTs;
+    seqTs.SetSeq(seq);
+    seqTs.SetPG(qp->m_pg);
+    p->AddHeader(seqTs);
+    // add udp header
+    UdpHeader udpHeader;
+    udpHeader.SetDestinationPort(qp->dport);
     udpHeader.SetSourcePort(sourcePort);
     p->AddHeader(udpHeader);
     // add ipv4 header
@@ -2411,22 +2456,7 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp) {
     // attach Stat Tag
     uint8_t packet_pos = UINT8_MAX;
     {
-        if (qp->psnPath.pathSelectionEnabled) {
-            PsnPathTag psnTag;
-            const uint32_t psn = seq / qp->psnPath.packetSize;
-            const PsnLaneState &lane = qp->psnPath.lanes[psn % qp->psnPath.k];
-            auto original = qp->psnPath.transmissions.find(psn);
-            const bool hasOriginal = isRetrans && original != qp->psnPath.transmissions.end();
-            psnTag.SetEpoch(hasOriginal ? original->second.epoch : lane.epoch);
-            psnTag.SetK(qp->psnPath.k);
-            psnTag.SetO(hasOriginal ? original->second.offset : lane.offset);
-            psnTag.SetFpsn(hasOriginal ? original->second.fpsn : lane.fpsn);
-            psnTag.SetActivePathMask(BuildActivePathMask(qp->psnPath.pathStats));
-            psnTag.SetPathId(selectedPathId);
-            psnTag.SetProbe(probeFlag);
-            psnTag.SetFlowSport(qp->sport);
-            p->AddPacketTag(psnTag);
-        }
+        if (qp->psnPath.pathSelectionEnabled) p->AddPacketTag(psnTag);
         FlowIDNUMTag fint;
         if (!p->PeekPacketTag(fint)) {
             fint.SetId(qp->m_flow_id);
@@ -2739,6 +2769,10 @@ uint32_t RdmaHw::GetPsnPathControlBytes() const {
                ? PsnPath::kControlBytes : 0;
 }
 
+uint32_t RdmaHw::GetPsnPathControlBytes(const PsnPathTag &tag) const {
+    return GetPsnPathControlBytes() != 0 ? tag.GetControlBytes() : 0;
+}
+
 void RdmaHw::EvaluatePathState(Ptr<RdmaQueuePair> qp) {
     if (!qp->psnPath.pathSelectionEnabled || !qp->psnPath.pathSwitchEnabled) return;
     NS_ABORT_MSG_IF(m_psnPathBeta == PsnPathScore::UnsetThreshold() ||
@@ -2756,25 +2790,38 @@ void RdmaHw::EvaluatePathState(Ptr<RdmaQueuePair> qp) {
                     remove == PsnPathScore::UnsetThreshold() ||
                     !std::isfinite(explore) || !std::isfinite(remove) || remove > explore,
                     "PSN-PATH requires explicit ordered path thresholds");
-    NS_ABORT_MSG_IF(explore > remove,
-                    "Gradual DT-Switch is pending protocol clarification; only removal-only switching is supported");
     qp->psnPath.InitializeLanes();
     // Old-path feedback is kept in its original slot, but never judges a new mapping.
-    for (uint32_t lane = 0; lane < qp->psnPath.k; ++lane) {
-        const uint32_t pathId = qp->psnPath.SelectPath(lane);
-        PsnPathStats &stats = qp->psnPath.pathStats[pathId];
+    for (auto &stats : qp->psnPath.pathStats) {
         if (stats.ackCount == 0 && stats.nackCount == 0) continue;
         if (m_enablePsnPathNormalizedScore) {
             PsnPathScore::TryNormalize(stats.ackCount, stats.nackCount, m_psnPathBeta, stats.score);
         } else {
             stats.score = double(stats.ackCount) - m_psnPathBeta * double(stats.nackCount);
         }
+    }
+    for (uint32_t laneId = 0; laneId < qp->psnPath.k; ++laneId) {
+        PsnLaneState &lane = qp->psnPath.lanes[laneId];
+        const uint32_t pathId = qp->psnPath.SelectPath(laneId);
+        // Copy before candidate allocation can grow pathStats.
+        const PsnPathStats stats = qp->psnPath.pathStats[pathId];
+        const bool hasFeedback = stats.ackCount != 0 || stats.nackCount != 0;
+        if (!hasFeedback) continue;
         if (stats.score < remove) {
-            NS_ABORT_MSG_IF(!qp->psnPath.ReplacePath(lane),
+            NS_ABORT_MSG_IF(!qp->psnPath.ReplacePath(laneId),
                             "PSN-PATH exhausted available UDP source ports");
-            ++qp->stat.pathSwitchCount;
+        } else if (lane.probeStep != 0) {
+            if (lane.migrating) continue;
+            const PsnPathStats &candidate = qp->psnPath.pathStats[laneId + lane.candidateOffset];
+            if (candidate.ackCount == 0 && candidate.nackCount == 0) continue;
+            if (candidate.score >= stats.score) qp->psnPath.ConfirmCandidate(laneId);
+            else qp->psnPath.AbortProbe(laneId);
+        } else if (stats.score < explore) {
+            NS_ABORT_MSG_IF(!qp->psnPath.StartProbe(laneId, m_psnPathProbeFrequency),
+                            "PSN-PATH exhausted candidate offsets representable by Explore");
         }
     }
+    qp->stat.pathSwitchCount = qp->psnPath.switchCount;
     for (auto &stats : qp->psnPath.pathStats) {
         stats.ackCount = 0;
         stats.nackCount = 0;
@@ -2784,9 +2831,9 @@ void RdmaHw::EvaluatePathState(Ptr<RdmaQueuePair> qp) {
 
 void RdmaHw::SchedulePathStateEval(Ptr<RdmaQueuePair> qp) {
     if (!qp->psnPath.pathSelectionEnabled || !qp->psnPath.pathSwitchEnabled) return;
-    NS_ABORT_MSG_IF(!std::isfinite(m_psnPathEvalIntervalUs) || m_psnPathEvalIntervalUs <= 0,
-                    "PSN-PATH requires an explicit positive evaluation interval");
-    const Time interval = MicroSeconds(m_psnPathEvalIntervalUs);
+    NS_ABORT_MSG_IF(qp->m_baseRtt == 0 || qp->m_baseRtt > uint64_t(INT64_MAX),
+                    "PSN-PATH requires a positive representable QP base RTT");
+    const Time interval = NanoSeconds(qp->m_baseRtt);
     NS_ABORT_MSG_IF(interval <= Time(0), "PSN-PATH evaluation interval is below simulator resolution");
     qp->psnPath.evalEvent = Simulator::Schedule(interval, &RdmaHw::EvaluatePathState, this, qp);
 }

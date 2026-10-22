@@ -185,7 +185,7 @@ double psn_path_beta = PsnPathScore::UnsetThreshold();
 bool psn_path_normalize_score = false;
 uint32_t psn_path_base_port = 0;
 uint32_t psn_path_offset = 0;
-double psn_path_eval_interval_us = 0;
+uint32_t psn_path_probe_frequency = 0;
 double psn_path_t_explore = PsnPathScore::UnsetThreshold();
 double psn_path_t_remove = PsnPathScore::UnsetThreshold();
 double psn_path_normalized_t_explore = PsnPathScore::UnsetThreshold();
@@ -1648,9 +1648,11 @@ int main(int argc, char *argv[]) {
                 if (!(conf >> psn_path_offset) || psn_path_offset > UINT16_MAX)
                     NS_FATAL_ERROR("PSN_PATH_O must fit the path control word");
             } else if (key == "PSN_PATH_EVAL_INTERVAL_US") {
-                if (!(conf >> psn_path_eval_interval_us) || !std::isfinite(psn_path_eval_interval_us) ||
-                    psn_path_eval_interval_us <= 0)
-                    NS_FATAL_ERROR("PSN_PATH_EVAL_INTERVAL_US requires an explicit positive interval");
+                NS_FATAL_ERROR("Path evaluation uses the QP base RTT");
+            } else if (key == "PSN_PATH_PROBE_FREQUENCY") {
+                if (!(conf >> psn_path_probe_frequency) || psn_path_probe_frequency == 0 ||
+                    psn_path_probe_frequency > 0x7f)
+                    NS_FATAL_ERROR("PSN_PATH_PROBE_FREQUENCY must fit the positive seven-bit DT-Switch step f");
             } else if (key == "PSN_PATH_T_EXPLORE") {
                 if (!(conf >> psn_path_t_explore)) NS_FATAL_ERROR("PSN_PATH_T_EXPLORE requires a numeric value");
             } else if (key == "PSN_PATH_T_REMOVE") {
@@ -1796,20 +1798,20 @@ int main(int argc, char *argv[]) {
     if (enable_path_switch && (enable_psn_path || enable_path_select)) {
         if (psn_path_beta == PsnPathScore::UnsetThreshold())
             NS_FATAL_ERROR("PSN-PATH switching requires explicit PSN_PATH_BETA");
-        if (psn_path_eval_interval_us <= 0)
-            NS_FATAL_ERROR("PSN-PATH switching requires explicit PSN_PATH_EVAL_INTERVAL_US");
         if (!psn_path_normalize_score &&
             (psn_path_t_explore == PsnPathScore::UnsetThreshold() ||
              psn_path_t_remove == PsnPathScore::UnsetThreshold() ||
              !std::isfinite(psn_path_t_explore) || !std::isfinite(psn_path_t_remove) ||
              psn_path_t_remove > psn_path_t_explore))
             NS_FATAL_ERROR("Raw path scores require explicit ordered PSN_PATH_T_EXPLORE and PSN_PATH_T_REMOVE");
-        // Candidate migration is deliberately pending the author's protocol decision.
-        // Refuse the unsupported region up front, not halfway through an experiment.
         const double explore = psn_path_normalize_score ? psn_path_normalized_t_explore : psn_path_t_explore;
         const double remove = psn_path_normalize_score ? psn_path_normalized_t_remove : psn_path_t_remove;
-        if (explore != PsnPathScore::UnsetThreshold() && remove != PsnPathScore::UnsetThreshold() && explore > remove)
-            NS_FATAL_ERROR("Gradual DT-Switch is pending protocol clarification; only fixed paths and removal-only switching are supported");
+        if (explore != PsnPathScore::UnsetThreshold() && remove != PsnPathScore::UnsetThreshold() && explore > remove) {
+            if (psn_path_probe_frequency == 0)
+                NS_FATAL_ERROR("DT-Switch exploration requires explicit PSN_PATH_PROBE_FREQUENCY");
+            if (!(enable_psn_path || enable_path_aware_retrans) || enable_bitmap_retrans || enable_falcon || enable_ornic)
+                NS_FATAL_ERROR("DT-Switch exploration requires PSN-PATH path-aware recovery");
+        }
     }
     if (psn_path_normalize_score &&
         (psn_path_beta == PsnPathScore::UnsetThreshold() ||
@@ -2177,7 +2179,7 @@ int main(int argc, char *argv[]) {
             rdmaHw->SetAttribute("PsnPathK", UintegerValue(psn_path_k));
             rdmaHw->SetAttribute("PsnPathO", UintegerValue(psn_path_offset));
             rdmaHw->SetAttribute("PsnPathBasePort", UintegerValue(psn_path_base_port));
-            rdmaHw->SetAttribute("PsnPathEvalIntervalUs", DoubleValue(psn_path_eval_interval_us));
+            rdmaHw->SetAttribute("PsnPathProbeFrequency", UintegerValue(psn_path_probe_frequency));
             rdmaHw->SetAttribute("PsnPathTExplore", DoubleValue(psn_path_t_explore));
             rdmaHw->SetAttribute("PsnPathTRemove", DoubleValue(psn_path_t_remove));
             rdmaHw->SetAttribute("PsnPathBeta", DoubleValue(psn_path_beta));

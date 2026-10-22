@@ -103,9 +103,9 @@ Fill in network and algorithm settings consistently with the input files:
   Map rates are integer bit/s; queue thresholds are decimal KB.
 - Set the recovery switches for the selected model. See
   [recovery settings](#recovery-models) for their combinations and scope.
-- For PSN-PATH, supply `PSN_PATH_K`. Supply the loss penalty, thresholds, and
-  evaluation interval required by the selected scoring and switching mode. See
-  [path scoring](#psn-path-mapping-and-scoring).
+- For PSN-PATH, supply `PSN_PATH_K`. Supply the loss penalty and thresholds required by the selected
+  scoring and switching mode. See
+  [PSN-PATH configuration](#psn-path-configuration).
 
 Parameter units are listed in the [configuration reference](#configuration-reference).
 
@@ -172,135 +172,15 @@ baseline recovery switches.
 
 The direct out-of-order NACK and NACK-triggered GoBack switches select additional
 behaviors. Keep them disabled for standalone IRN selective recovery. PSN-PATH
-configuration is described under [path mapping and scoring](#psn-path-mapping-and-scoring).
+configuration is described under [PSN-PATH configuration](#psn-path-configuration).
 
-### GBN and IRN
-
-GBN rolls back to the cumulative ACK on NACK or timeout and retransmits the suffix.
-IRN retains selective acknowledgment state and skips received packets during
-recovery. The first recovery retransmission starts at the cumulative ACK;
-subsequent inferred holes require a higher selectively acknowledged packet.
-Unproven tail losses remain subject to timeout recovery. Recovery ends when the
-cumulative ACK covers the original recovery boundary.
-
-IRN's BDP-FC bounds outstanding data. `IRN_BDP` is a byte limit. If omitted or
-zero, the driver uses the maximum BDP computed from the loaded topology and
-routes. A positive configured value overrides that computation. The effective
-limit must be positive and fit the simulator's field. Retransmissions do not
-consume new sequence space.
-
-BDP-FC and selective recovery are described in
-[IRN, Sections 3.1–3.2](https://arxiv.org/html/1806.08159).
-
-### Falcon OOO-D recovery
-
-The modeled early-retransmission rule follows the out-of-order distance mechanism
-in the [OCP Falcon Transport Protocol specification, Sections 9.1.1 and 9.1.4](https://www.opencompute.org/documents/falcon-spec-v1-1-pdf-1):
-
-```text
-highest selectively acknowledged PSN - missing PSN > distance threshold
-age since the packet's latest transmission > recency interval
-```
-
-`FALCON_OOO_DISTANCE_THRESHOLD` sets the PSN-distance threshold within the modeled
-ACK bitmap. `FALCON_RETRANS_RTT_K` scales the RTT-based recency interval and must
-be finite and at least one. Without an RTT estimate, the model uses ordinary
-timeout recovery. Deferred retransmissions recheck acknowledgment state and the
-latest send time before entering the transmit queue.
-
-This is the OOO-D recovery model. The
-[Falcon SIGCOMM 2025 paper](https://praveenk.io/papers/falcon.pdf) also describes
-RACK-TLP recovery; selecting this model does not enable RACK-TLP.
-
-### ORNIC OTD-based recovery
-
-The [ORNIC paper, Section 3.3](https://www.mdpi.com/2079-9292/14/1/88)
-defines OTD from the maximum multipath delay difference, send bandwidth, and
-packet length, and supports per-QP OTD configuration.
-
-```text
-MDD = (RTT_max - RTT_min) / 2
-OTD = MDD * B / packet_length
-```
-
-Use the slowest and fastest paths of the selected multipath strategy for
-`RTT_max` and `RTT_min`. With RTTs in seconds and sending bandwidth `B` in bit/s,
-`packet_length` is in bits and OTD is a distance in packet sequence numbers.
-
-Set `ORNIC_OTD` explicitly when `ENABLE_ORNIC` is enabled. It must be finite and
-nonnegative; a missing value is an error. The driver uses this value to initialize
-each receive QP's OTD. The receiver triggers loss recovery when the PSN distance
-exceeds that QP's configured OTD. Sender timeout recovery covers losses without
-subsequent packets, as described in Section 3.3.
-
-### Traditional Bitmap
-
-`BITMAP_RETRANS_SIZE` controls the receive bitmap. The receiver records
-out-of-order packets and returns cumulative ACKs. Overflow or the optional gap
-feedback timer requests recovery of the earliest hole.
-`BITMAP_RETRANS_TIMEOUT_NS` configures that receiver timer; zero disables it.
-The feedback does not carry a full selective-ACK bitmap to the sender.
-
-This model follows the traditional Bitmap method in the
-[RDMA reference repository](https://github.com/tomyu872-jpg/RDMA/tree/7df1d53e7818b0909a0948e44f5aa4f78951b141).
-
-### Timing in the simulation
-
-Sender timeout recovery is available for losses without later feedback, including
-tail losses. Control packets enter the NIC queue and experience modeled queueing,
-serialization, and propagation delays.
-
-Falcon uses packet timestamp metadata for its RTT-based recency check. The metadata
-is an ns-3 packet tag rather than an additional serialized header. HPCC INT fields
-are interpreted according to their header mode.
-
-## PSN-PATH mapping and scoring
-
-### Path mapping and recovery
-
-Original packets use logical lanes selected by `PSN % K`. Each lane maintains its
-own source-port offset and mapping boundary. Replacing a degraded path changes
-that lane's source port while retaining the lane count and the other mappings.
-A distinct source port is a routing input; the topology and ECMP hash determine
-its physical route.
-
-The receiver tracks the lane, mapping generation, and source port. Observing a
-new mapping does not establish loss on its predecessor. Retransmissions retain
-the original mapping boundary and may use the lane's current port. Such rerouted
-retransmissions are not ordering evidence for the new path. Same-path evidence
-supports loss detection; sender timeout recovery handles gaps without later
-same-path evidence.
-
-The simulator carries control metadata in packet tags and accounts for the
-PSN-PATH control-word length in packet serialization. The receiver separates that
-length from the data payload.
-
-### Scoring
-
-```text
-raw_score = ACK - beta * NACK
-normalized_score = (ACK - beta * NACK) / (ACK + NACK)
-```
-
-The sender attributes observations to original transmissions and their original
-paths. Cumulative ACKs account for each covered packet. Repeated feedback is
-deduplicated, and retransmitted packets are excluded from successful-original
-counts. Losses are counted once. An evaluation window with no observations keeps
-the previous score and does not independently trigger replacement.
-
-Set `PSN_PATH_NORMALIZE_SCORE` to select normalization. For finite nonnegative
-`beta`, normalized scores lie in `[-beta, 1]`. Thresholds must satisfy
-`-beta <= remove <= explore <= 1`. Threshold comparisons are strict.
-Normalization is an optional scoring extension; thresholds are supplied directly
-in the chosen score scale.
-
-### Configuration
+## PSN-PATH configuration
 
 | Key | Meaning |
 | --- | --- |
 | `ENABLE_PSN_PATH` | Enable path selection and path-aware recovery. |
 | `ENABLE_PATH_SELECT`, `ENABLE_PATH_AWARE_RETRANS` | Control those capabilities separately. |
-| `ENABLE_PATH_SWITCH` | Enable periodic path evaluation and replacement; requires path selection. |
+| `ENABLE_PATH_SWITCH` | Enable DT-Switch path evaluation, candidate exploration, and migration; requires path selection. |
 | `PSN_PATH_K` | Positive logical lane count, required when PSN-PATH, path selection, or path-aware recovery is enabled. |
 | `PSN_PATH_BASE_PORT` | Optional base UDP source port; otherwise the QP's original source port is used. |
 | `PSN_PATH_O` | Optional initial offset. |
@@ -308,12 +188,34 @@ in the chosen score scale.
 | `PSN_PATH_BETA` | Explicit loss penalty, required for normalization or switching. |
 | `PSN_PATH_NORMALIZED_T_EXPLORE`, `PSN_PATH_NORMALIZED_T_REMOVE` | Explicit thresholds when normalization is enabled. |
 | `PSN_PATH_T_EXPLORE`, `PSN_PATH_T_REMOVE` | Explicit raw-score thresholds when switching is enabled without normalization. |
-| `PSN_PATH_EVAL_INTERVAL_US` | Positive evaluation interval, in microseconds, required for switching. |
+| `PSN_PATH_PROBE_FREQUENCY` | Explicit initial step `f`: send one candidate packet for every `f` original-path packets in the same lane. Required when the explore threshold exceeds the remove threshold; must fit Explore's positive seven-bit step field. |
 
-The implemented switching mode replaces degraded paths per lane. Configure equal
-explore and remove thresholds for this mode. Fixed mappings are selected by
-leaving switching disabled. Candidate exploration and gradual migration are not
-implemented by this mode.
+DT-Switch evaluates each logical lane independently. A score below the removal
+threshold triggers a source-port search starting at the lane's current offset
+plus one, skipping mappings still in use. A score between the removal and
+exploration thresholds starts candidate exploration,
+including when all original lanes are active. Candidate and original paths use
+the same selected score formula; a candidate with a score no lower than the
+original path enters gradual migration. A lower-scoring candidate is discarded;
+later evaluation windows may start another probe. Each `f` successful candidate
+ACKs reduces `f` by one until the lane moves fully to the candidate. A candidate
+NACK cancels exploration or migration and retains the original mapping. The sender
+RTO also recovers packets whose loss has no later same-path witness.
+
+During exploration and gradual migration, packets carry the switching status,
+step, candidate offset, and phase-start PSN. FPSN identifies the first original
+packet of a physical mapping and remains unchanged as the migration step changes.
+The phase-start PSN is a simulation metadata extension for deriving the alternating
+schedule. After completion or cancellation, this extension is retained until a
+cumulative ACK covers the first original packet under the final schedule; steady
+packets then omit it. Retransmissions retain the optional fields of their original
+transmission, even if the lane has since changed state.
+
+Packet lengths include the seven-byte path control word and, only when present,
+the two-byte Explore field and four-byte phase-start extension. The receiver uses
+the same per-packet layout to recover the data payload length. Configure the step
+and score parameters directly in `config.txt`; the template contains placeholders.
+Leave switching disabled for fixed mappings.
 
 Packet sequence numbers use the configured payload length.
 

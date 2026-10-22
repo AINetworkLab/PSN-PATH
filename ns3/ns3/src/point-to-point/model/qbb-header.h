@@ -26,7 +26,8 @@ public:
   enum {
 	  FLAG_CNP = 0,
 	  FLAG_DIRECT_NACK = 1,
-	  FLAG_FALCON_BITMAP = 2
+	  FLAG_FALCON_BITMAP = 2,
+	  FLAG_PSN_PATH_RANGE = 3
   };
   qbbHeader (uint16_t pg);
   qbbHeader ();
@@ -47,6 +48,9 @@ public:
   void SetIrnNackSize(size_t sz);
   void SetDirectNack();
   void SetFalconBitmap(uint64_t bitmap, uint16_t bits);
+  // Start sequence/packet length remain in the selective-NACK fields. Reuse
+  // the reserved bitmap slots for K, path ID and the inclusive final PSN.
+  void SetPsnPathNackRange(uint32_t pathId, uint16_t k, uint32_t endPsn);
 
 //Getters
   /**
@@ -64,6 +68,9 @@ public:
   uint8_t GetDirectNack() const;
   uint64_t GetFalconBitmap() const;
   uint16_t GetFalconBitmapBits() const;
+  uint32_t GetPsnPathNackPath() const;
+  uint16_t GetPsnPathNackK() const;
+  uint32_t GetPsnPathNackEnd() const;
 
   static TypeId GetTypeId (void);
   virtual TypeId GetInstanceTypeId (void) const;

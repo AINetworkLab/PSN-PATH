@@ -20,6 +20,8 @@
 
 namespace ns3 {
 
+class PsnPathTag;
+
 struct RdmaInterfaceMgr {
     Ptr<QbbNetDevice> dev;
     Ptr<RdmaQueuePairGroup> qpGrp;
@@ -121,6 +123,7 @@ class RdmaHw : public Object {
 
     void HandleTimeout(Ptr<RdmaQueuePair> qp, Time rto);
     uint32_t GetPsnPathControlBytes() const;
+    uint32_t GetPsnPathControlBytes(const PsnPathTag &tag) const;
     void EvaluatePathState(Ptr<RdmaQueuePair> qp);
     void SchedulePathStateEval(Ptr<RdmaQueuePair> qp);
 
@@ -232,7 +235,7 @@ class RdmaHw : public Object {
     double m_psnPathNormalizedTRemove;
     double m_psnPathTExplore;
     double m_psnPathTRemove;
-    double m_psnPathEvalIntervalUs;
+    uint32_t m_psnPathProbeFrequency;
     BitmapRetransModule m_bitmapRetrans;
     FalconRetransModule m_falcon;
     OrnicRetransModule m_ornicRetrans;

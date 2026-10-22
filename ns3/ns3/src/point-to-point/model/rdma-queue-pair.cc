@@ -18,6 +18,74 @@ namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE("RdmaQueuePair");
 
+uint32_t PsnMappingSnapshot::PathForPsn(uint32_t psn) const {
+    NS_ABORT_MSG_IF(k == 0, "PSN-PATH requires positive K for path lookup");
+    // The phase anchor defines the split schedule independently of the
+    // physical mapping's FPSN. It is carried in simulation tag metadata.
+    const bool candidate = probeStep != 0 && psn >= phaseStart &&
+        ((psn - phaseStart) / k) % (probeStep + 1) == probeStep;
+    return lane + (candidate ? candidateOffset : o);
+}
+
+bool PsnMappingSnapshot::PreviousPsn(uint32_t psn, uint32_t &previous) const {
+    return PreviousPsnOnPath(psn, PathForPsn(psn), previous);
+}
+
+bool PsnMappingSnapshot::PreviousPsnOnPath(uint32_t before, uint32_t path,
+                                         uint32_t &previous) const {
+    NS_ABORT_MSG_IF(k == 0, "PSN-PATH requires positive K for predecessor lookup");
+    if (before <= phaseStart) return false;
+    uint64_t ordinal = (uint64_t(before) - phaseStart - 1) / k;
+    if (path == lane + o) {
+        if (probeStep != 0 && ordinal % (uint64_t(probeStep) + 1) == probeStep)
+            --ordinal;
+    } else if (probeStep != 0 && path == lane + candidateOffset) {
+        const uint64_t period = uint64_t(probeStep) + 1;
+        if (ordinal < probeStep) return false;
+        ordinal -= (ordinal - probeStep) % period;
+    } else {
+        return false;
+    }
+    previous = phaseStart + ordinal * k;
+    return true;
+}
+
+bool RdmaRxQueuePair::ObservePsnMapping(const PsnMappingSnapshot &mapping) {
+    // Keep only the current FPSN* boundary required for this logical lane.
+    // Late packets from older mappings must never roll the boundary back.
+    auto boundary = psnMappingFpsn.emplace(mapping.lane, mapping.lane).first;
+    if (mapping.fpsn <= boundary->second) return false;
+    boundary->second = mapping.fpsn;
+    return true;
+}
+
+bool RdmaRxQueuePair::FindPsnPredecessor(const PsnMappingSnapshot &mapping,
+                                       uint32_t psn, uint32_t &previous) const {
+    // The current packet describes only its own alternating-send phase.
+    // A predecessor across that phase boundary is left to sender RTO recovery.
+    return mapping.PreviousPsn(psn, previous) && previous >= mapping.fpsn;
+}
+
+bool RdmaRxQueuePair::FindPsnLossRange(const PsnMappingSnapshot &mapping,
+                                     uint32_t psn, uint32_t expectedPsn,
+                                     PsnPathNackRange &range) const {
+    uint32_t previous;
+    if (!FindPsnPredecessor(mapping, psn, previous) || previous < expectedPsn ||
+        bitmap[previous % BITMAP_SIZE] != 0) return false;
+    range.pathId = mapping.pathId;
+    range.k = mapping.k;
+    range.startPsn = range.endPsn = previous;
+    while (range.startPsn > expectedPsn) {
+        // Aggregate only losses identifiable from this packet's phase metadata.
+        // Do not reconstruct or retain earlier sending schedules.
+        if (!FindPsnPredecessor(mapping, range.startPsn, previous) ||
+            previous >= range.startPsn || previous < expectedPsn ||
+            bitmap[previous % BITMAP_SIZE] != 0) break;
+        range.startPsn = previous;
+    }
+    return true;
+}
+
 void PsnPathState::InitializeLanes() {
     NS_ABORT_MSG_IF(k == 0, "PSN-PATH requires explicit positive K");
     if (!lanes.empty()) return;
@@ -28,6 +96,9 @@ void PsnPathState::InitializeLanes() {
     for (auto &stats : pathStats) stats.active = false;
     for (uint32_t lane = 0; lane < k; ++lane) {
         lanes[lane].offset = o;
+        lanes[lane].fpsn = lane;
+        lanes[lane].phaseStart = lane;
+        lanes[lane].candidateCursor = o;
         pathStats[lane + o].active = true;
     }
     activePathCount = k;
@@ -37,6 +108,20 @@ uint32_t PsnPathState::SelectPath(uint32_t psn) const {
     NS_ABORT_MSG_IF(k == 0 || lanes.size() != k, "PSN-PATH lanes are not initialized");
     const uint32_t lane = psn % k;
     return lane + lanes[lane].offset;
+}
+
+uint32_t PsnPathState::SelectOriginalPath(uint32_t psn) const {
+    const uint32_t laneId = psn % k;
+    const PsnLaneState &lane = lanes[laneId];
+    PsnMappingSnapshot mapping;
+    mapping.k = k;
+    mapping.lane = laneId;
+    mapping.o = lane.offset;
+    mapping.fpsn = lane.fpsn;
+    mapping.phaseStart = lane.phaseStart;
+    mapping.probeStep = lane.probeStep;
+    mapping.candidateOffset = lane.candidateOffset;
+    return mapping.PathForPsn(psn);
 }
 
 void PsnPathState::RecordTransmission(uint32_t psn, uint32_t size, bool retransmitted) {
@@ -49,44 +134,196 @@ void PsnPathState::RecordTransmission(uint32_t psn, uint32_t size, bool retransm
     if (retransmitted) return;
     PsnLaneState &lane = lanes[psn % k];
     if (lane.boundaryPending) {
-        lane.fpsn = psn;
+        lane.phaseStart = psn;
         lane.boundaryPending = false;
     }
+    if (lane.physicalBoundaryPending) {
+        lane.fpsn = psn;
+        lane.physicalBoundaryPending = false;
+    }
     PsnTransmission tx;
-    tx.pathId = SelectPath(psn);
-    tx.epoch = lane.epoch;
-    tx.fpsn = lane.fpsn;
+    tx.pathId = SelectOriginalPath(psn);
+    tx.phaseStart = lane.phaseStart;
+    tx.hasPhaseInfo = lane.probeStep != 0 || lane.phaseClosing;
     tx.offset = lane.offset;
     tx.size = size;
+    tx.probeStep = lane.probeStep;
+    tx.candidateOffset = lane.candidateOffset;
+    tx.candidateGeneration = lane.candidateGeneration;
+    tx.probe = lane.probeStep != 0 && tx.pathId == psn % k + lane.candidateOffset;
+    if (tx.probe && !lane.candidateStarted) {
+        lane.candidateFpsn = psn;
+        lane.candidateStarted = true;
+    }
+    tx.fpsn = tx.probe ? lane.candidateFpsn : lane.fpsn;
     transmissions.emplace(psn, tx);
+}
+
+bool PsnPathState::FindAvailablePath(uint32_t laneId, uint32_t startOffset,
+                                   uint32_t maxOffset, uint32_t &path) {
+    PsnLaneState &lane = lanes[laneId];
+    const uint32_t lastOffset = std::min<uint32_t>(maxOffset, UINT16_MAX - basePort - laneId);
+    const uint64_t offsetCount = uint64_t(lastOffset) + 1;
+    // Revisit released offsets after wrapping the field, while retaining every
+    // active, probing, or in-flight mapping until it is safe to reuse.
+    for (uint64_t attempt = 1; attempt <= offsetCount; ++attempt) {
+        const uint32_t offset = (uint64_t(startOffset) + attempt) % offsetCount;
+        const uint32_t nextPath = laneId + offset;
+        bool occupied = nextPath < pathStats.size() &&
+            (pathStats[nextPath].active || pathStats[nextPath].probing);
+        for (const auto &entry : transmissions) {
+            if (entry.second.pathId == nextPath) { occupied = true; break; }
+        }
+        if (occupied) continue;
+        lane.candidateCursor = offset;
+        path = nextPath;
+        return true;
+    }
+    return false;
+}
+
+bool PsnPathState::StartProbe(uint32_t laneId, uint32_t step) {
+    NS_ABORT_MSG_IF(step == 0 || step > 0x7f, "PSN-PATH probe step must fit Explore's seven bits");
+    PsnLaneState &lane = lanes[laneId];
+    if (lane.probeStep != 0) return true;
+    uint32_t candidate;
+    // Explore carries an eight-bit candidate offset (paper Fig. 7).
+    if (!FindAvailablePath(laneId, lane.candidateCursor, UINT8_MAX, candidate)) return false;
+    if (pathStats.size() <= candidate) pathStats.resize(candidate + 1);
+    pathStats[candidate] = PsnPathStats{};
+    pathStats[candidate].probing = true;
+    lane.candidateOffset = candidate - laneId;
+    lane.candidateStarted = false;
+    lane.probeStep = step;
+    lane.stepAcks = 0;
+    lane.migrating = false;
+    lane.candidateGeneration = ++mappingEpoch;
+    lane.phaseClosing = false;
+    lane.boundaryPending = true;
+    return true;
+}
+
+void PsnPathState::AbortProbe(uint32_t laneId) {
+    PsnLaneState &lane = lanes[laneId];
+    if (lane.probeStep == 0) return;
+    pathStats[laneId + lane.candidateOffset].probing = false;
+    lane.probeStep = 0;
+    lane.stepAcks = 0;
+    lane.migrating = false;
+    lane.candidateGeneration = 0;
+    lane.phaseClosing = true;
+    ++mappingEpoch;
+    lane.boundaryPending = true;
+}
+
+void PsnPathState::ConfirmCandidate(uint32_t laneId) {
+    PsnLaneState &lane = lanes[laneId];
+    NS_ABORT_MSG_IF(lane.probeStep == 0, "Cannot confirm a path which was not probed");
+    lane.migrating = true;
+    lane.stepAcks = 0;
+}
+
+void PsnPathState::CommitCandidate(uint32_t laneId) {
+    PsnLaneState &lane = lanes[laneId];
+    NS_ABORT_MSG_IF(lane.probeStep == 0 || !lane.candidateStarted,
+                    "Cannot commit a path before its first original packet");
+    pathStats[laneId + lane.offset].active = false;
+    const uint32_t candidate = laneId + lane.candidateOffset;
+    pathStats[candidate].active = true;
+    pathStats[candidate].probing = false;
+    lane.offset = lane.candidateOffset;
+    lane.fpsn = lane.candidateFpsn;
+    lane.phaseClosing = true;
+    lane.probeStep = 0;
+    lane.stepAcks = 0;
+    lane.migrating = false;
+    lane.candidateGeneration = 0;
+    ++mappingEpoch;
+    lane.boundaryPending = true;
+    ++switchCount;
 }
 
 bool PsnPathState::ReplacePath(uint32_t laneId) {
     PsnLaneState &lane = lanes[laneId];
     const uint32_t oldPath = laneId + lane.offset;
-    uint32_t nextPath = oldPath;
-    // Search source-port space without changing the logical lane or other lanes.
-    while (++nextPath + uint64_t(basePort) <= UINT16_MAX) {
-        bool occupied = false;
-        for (uint32_t other = 0; other < k; ++other) {
-            if (other != laneId && SelectPath(other) == nextPath) occupied = true;
-        }
-        if (occupied) continue;
+    AbortProbe(laneId);
+    uint32_t nextPath;
+    // Severe degradation searches from O_l + 1, independently of earlier probes.
+    if (FindAvailablePath(laneId, lane.offset, UINT16_MAX, nextPath)) {
         pathStats[oldPath].active = false;
         pathStats[oldPath].probing = false;
         if (pathStats.size() <= nextPath) pathStats.resize(nextPath + 1);
         pathStats[nextPath] = PsnPathStats{};
         pathStats[nextPath].active = true;
         lane.offset = nextPath - laneId;
-        lane.epoch = ++mappingEpoch;
+        lane.physicalBoundaryPending = true;
+        lane.phaseClosing = false;
+        ++mappingEpoch;
         lane.boundaryPending = true;
+        ++switchCount;
         return true;
     }
     return false;
 }
 
+void PsnPathState::RecordSuccess(uint32_t psn, PsnTransmission &tx) {
+    if (tx.ackCounted || tx.retransmitted || tx.lossCounted) return;
+    tx.ackCounted = true;
+    ++pathStats[tx.pathId].ackCount;
+    PsnLaneState &lane = lanes[psn % k];
+    if (!tx.probe || !lane.migrating ||
+        tx.candidateGeneration != lane.candidateGeneration) return;
+    if (++lane.stepAcks < lane.probeStep) return;
+    lane.stepAcks = 0;
+    if (lane.probeStep == 1) {
+        CommitCandidate(psn % k);
+    } else {
+        --lane.probeStep;
+        ++mappingEpoch;
+        lane.boundaryPending = true;
+    }
+}
+
+void PsnPathState::RecordLoss(uint32_t psn, PsnTransmission &tx) {
+    if (tx.lossCounted || tx.ackCounted) return;
+    ++pathStats[tx.pathId].nackCount;
+    tx.lossCounted = true;
+    const uint32_t laneId = psn % k;
+    if (tx.probe && tx.candidateGeneration == lanes[laneId].candidateGeneration)
+        AbortProbe(laneId);
+}
+
+void PsnPathState::RecordPathNack(const PsnPathNackRange &range, uint64_t ackSeq) {
+    NS_ABORT_MSG_IF(range.k == 0 || range.k != k || range.startPsn > range.endPsn ||
+                    range.startPsn % k != range.endPsn % k,
+                    "Invalid PSN-PATH loss range");
+    // Original transmission records disambiguate alternating migration stages.
+    // Never expand the numeric interval into packets from other physical paths.
+    for (auto it = transmissions.lower_bound(range.startPsn);
+         it != transmissions.end() && it->first <= range.endPsn; ++it) {
+        PsnTransmission &tx = it->second;
+        if (it->first % k != range.startPsn % k || tx.pathId != range.pathId ||
+            tx.ackCounted || uint64_t(it->first) * packetSize + tx.size <= ackSeq) continue;
+        RecordLoss(it->first, tx);
+        bool queued = false;
+        for (const auto &request : pendingRetrans) {
+            if (request.startPsn <= it->first && it->first <= request.endPsn) {
+                queued = true;
+                break;
+            }
+        }
+        if (!queued) {
+            PsnRetransRequest request;
+            request.startPsn = request.endPsn = it->first;
+            request.epoch = mappingEpoch;
+            pendingRetrans.push_back(request);
+        }
+    }
+}
+
 void PsnPathState::RecordFeedback(uint32_t ackSeq, bool loss,
-                                  uint32_t nackSeq, uint32_t nackSize) {
+                                  uint32_t nackSeq, uint32_t nackSize,
+                                  bool hasDelivery, uint32_t deliveredSeq, uint32_t deliveredSize) {
     if (packetSize == 0) return;
     // Count losses first: a NACK can also carry cumulative progress.
     if (loss && nackSize != 0) {
@@ -94,16 +331,24 @@ void PsnPathState::RecordFeedback(uint32_t ackSeq, bool loss,
         for (auto it = transmissions.lower_bound(nackSeq / packetSize);
              it != transmissions.end() && uint64_t(it->first) * packetSize < end; ++it) {
             PsnTransmission &tx = it->second;
-            if (!tx.lossCounted) {
-                ++pathStats[tx.pathId].nackCount;
-                tx.lossCounted = true;
-            }
+            RecordLoss(it->first, tx);
         }
+    }
+    if (hasDelivery) {
+        auto it = transmissions.find(deliveredSeq / packetSize);
+        if (it != transmissions.end() && it->second.size == deliveredSize)
+            RecordSuccess(it->first, it->second);
     }
     for (auto it = transmissions.begin(); it != transmissions.end();) {
         PsnTransmission &tx = it->second;
         if (uint64_t(it->first) * packetSize + tx.size > ackSeq) break;
-        if (!tx.retransmitted && !tx.lossCounted) ++pathStats[tx.pathId].ackCount;
+        RecordSuccess(it->first, tx);
+        PsnLaneState &lane = lanes[it->first % k];
+        // Only cumulative confirmation of the final boundary closes the
+        // transition. Later steady packets cannot scan past it into an older
+        // alternating schedule because the receiver has already admitted it.
+        if (lane.phaseClosing && !lane.boundaryPending && it->first == lane.phaseStart)
+            lane.phaseClosing = false;
         it = transmissions.erase(it);
     }
 }

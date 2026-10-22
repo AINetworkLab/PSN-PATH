@@ -49,23 +49,40 @@ struct PsnPathStats {
 // A logical lane survives physical path replacement (PSN modulo K is invariant).
 struct PsnLaneState {
     uint32_t offset{0};
-    uint32_t fpsn{0};
-    uint32_t epoch{0};
+    uint32_t fpsn{0};       // First original PSN of the committed physical mapping.
+    uint32_t phaseStart{0}; // First original PSN under the current split schedule.
     bool boundaryPending{false};
+    // Retain the final schedule boundary until cumulative ACK covers it.
+    bool phaseClosing{false};
+    bool physicalBoundaryPending{false};
+    uint32_t candidateFpsn{0};
+    bool candidateStarted{false};
+    uint32_t candidateOffset{0};
+    uint32_t candidateGeneration{0};
+    uint32_t candidateCursor{0};
+    uint32_t probeStep{0};
+    uint32_t stepAcks{0};
+    bool migrating{false};
 };
 
 struct PsnTransmission {
     uint32_t pathId{0};
-    uint32_t epoch{0};
+    uint32_t phaseStart{0};
     uint32_t fpsn{0};
     uint32_t offset{0};
     uint32_t size{0};
+    uint32_t probeStep{0};
+    uint32_t candidateOffset{0};
+    uint32_t candidateGeneration{0};
+    bool probe{false};
+    bool hasPhaseInfo{false};
+    bool ackCounted{false};
     bool retransmitted{false};
     bool lossCounted{false};
 };
 
 struct PsnMappingSnapshot {
-    uint32_t epoch{0};
+    uint32_t phaseStart{0};
     uint32_t k{0};
     uint32_t o{0};
     uint32_t fpsn{0};
@@ -73,12 +90,25 @@ struct PsnMappingSnapshot {
     uint32_t lane{0};
     uint32_t pathId{0};
     bool retransmission{false};
+    uint32_t probeStep{0};
+    uint32_t candidateOffset{0};
+
+    uint32_t PathForPsn(uint32_t psn) const;
+    bool PreviousPsn(uint32_t psn, uint32_t &previous) const;
+    bool PreviousPsnOnPath(uint32_t before, uint32_t path, uint32_t &previous) const;
 };
 
 struct PsnRetransRequest {
     uint32_t startPsn{0};
     uint32_t endPsn{0};
     uint32_t epoch{0};
+};
+
+struct PsnPathNackRange {
+    uint32_t pathId{0};
+    uint32_t k{0};
+    uint32_t startPsn{0};
+    uint32_t endPsn{0};
 };
 
 struct PsnPathState {
@@ -93,6 +123,7 @@ struct PsnPathState {
     uint32_t packetSize{0};
     uint32_t fpsn{0};
     uint32_t mappingEpoch{0};
+    uint64_t switchCount{0};
     std::vector<PsnPathStats> pathStats;
     std::vector<PsnLaneState> lanes;
     // Only unacknowledged original transmissions; never evict in-flight context.
@@ -100,11 +131,24 @@ struct PsnPathState {
 
     void InitializeLanes();
     uint32_t SelectPath(uint32_t psn) const;
+    uint32_t SelectOriginalPath(uint32_t psn) const;
     void RecordTransmission(uint32_t psn, uint32_t size, bool retransmitted);
     bool ReplacePath(uint32_t lane);
-    void RecordFeedback(uint32_t ackSeq, bool loss, uint32_t nackSeq, uint32_t nackSize);
+    bool StartProbe(uint32_t lane, uint32_t step);
+    void AbortProbe(uint32_t lane);
+    void ConfirmCandidate(uint32_t lane);
+    void CommitCandidate(uint32_t lane);
+    void RecordPathNack(const PsnPathNackRange &range, uint64_t ackSeq);
+    void RecordFeedback(uint32_t ackSeq, bool loss, uint32_t nackSeq, uint32_t nackSize,
+                        bool hasDelivery = false, uint32_t deliveredSeq = 0,
+                        uint32_t deliveredSize = 0);
     std::deque<PsnRetransRequest> pendingRetrans;
     EventId evalEvent;
+
+private:
+    bool FindAvailablePath(uint32_t lane, uint32_t startOffset, uint32_t maxOffset, uint32_t &path);
+    void RecordSuccess(uint32_t psn, PsnTransmission &tx);
+    void RecordLoss(uint32_t psn, PsnTransmission &tx);
 };
 
 struct OrnicState {
@@ -314,8 +358,11 @@ class RdmaRxQueuePair : public Object {  // Rx side queue pair
     uint32_t outcount{0};
     uint32_t lastoutseq{0};
     bool psnPacketContextValid{false};
+    bool psnPacketAccepted{false};
     bool psnFirstMappingObservation{false};
     PsnMappingSnapshot psnPacketContext;
+    bool psnNackRangeValid{false};
+    PsnPathNackRange psnNackRange;
     EventId bitmapExpectedTimerEvent;
     uint32_t bitmapExpectedTimeoutSeq{0xffffffffu};
     bool bitmapExpectedNackSent{false};
@@ -342,12 +389,18 @@ class RdmaRxQueuePair : public Object {  // Rx side queue pair
     uint32_t m_ackSeqOverride{0};
     EventId QcnTimerEvent;  // if destroy this rxQp, remember to cancel this timer
     IrnSackManager m_irn_sack_;
-    std::vector<PsnMappingSnapshot> psnMappingHistory;
+    // Current FPSN* per logical lane; no receive-side schedule history.
+    std::map<uint32_t, uint32_t> psnMappingFpsn;
     int32_t m_flow_id;
 
     static TypeId GetTypeId(void);
     RdmaRxQueuePair();
     uint32_t GetHash(void);
+    bool ObservePsnMapping(const PsnMappingSnapshot &mapping);
+    bool FindPsnPredecessor(const PsnMappingSnapshot &mapping, uint32_t psn,
+                           uint32_t &previous) const;
+    bool FindPsnLossRange(const PsnMappingSnapshot &mapping, uint32_t psn,
+                         uint32_t expectedPsn, PsnPathNackRange &range) const;
 };
 
 class RdmaQueuePairGroup : public Object {

@@ -76,6 +76,23 @@ namespace ns3 {
 	{
 		return m_pg;
 	}
+	void qbbHeader::SetPsnPathNackRange(uint32_t pathId, uint16_t k, uint32_t endPsn){
+		NS_ASSERT_MSG((flags & (1 << FLAG_FALCON_BITMAP)) == 0,
+		              "PSN-PATH range and Falcon bitmap are mutually exclusive");
+		flags |= 1 << FLAG_PSN_PATH_RANGE;
+		m_falcon_bitmap_bits = k;
+		m_falcon_bitmap_hi = pathId;
+		m_falcon_bitmap_lo = endPsn;
+	}
+	uint32_t qbbHeader::GetPsnPathNackPath() const{
+		return m_falcon_bitmap_hi;
+	}
+	uint16_t qbbHeader::GetPsnPathNackK() const{
+		return m_falcon_bitmap_bits;
+	}
+	uint32_t qbbHeader::GetPsnPathNackEnd() const{
+		return m_falcon_bitmap_lo;
+	}
 
 	uint32_t qbbHeader::GetSeq() const
 	{
